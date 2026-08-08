@@ -185,6 +185,10 @@ struct Shared {
     /// The most recent progress line from a running task (e.g. a `docker compose`
     /// pull line), shown live as the busy indicator's status.
     activity: Option<String>,
+    /// A manual "check for updates now" is in flight.
+    update_checking: bool,
+    /// Result of a manual update check, consumed by the UI on the next tick.
+    update_check: Option<crate::update::CheckOutcome>,
 }
 
 struct State {
@@ -279,6 +283,8 @@ struct State {
     update_latest: Arc<Mutex<Option<crate::update::Release>>>,
     /// A newer, non-skipped release to prompt the user about (the update modal).
     update_available: Option<crate::update::Release>,
+    /// A manual "Check for updates now" is running (for the Settings button state).
+    checking_update: bool,
 }
 
 /// Start the host microservice operator on a background thread, wiring the
@@ -350,6 +356,8 @@ enum Message {
     UpdateSkip,
     /// Dismiss the update prompt for now (reappears on the next check).
     UpdateDismiss,
+    /// Run a release check immediately (the Settings "Check for updates now").
+    CheckForUpdates,
     OpenBrowser,
     ShowSettings,
     CloseSettings,
@@ -462,6 +470,7 @@ impl State {
             singleton,
             update_latest,
             update_available: None,
+            checking_update: false,
         }
     }
 
@@ -638,6 +647,22 @@ impl State {
             // One-shot: a task emitted a dialog-worthy instruction (NEXT STEPS).
             if let Some(msg) = s.pending_dialog.take() {
                 self.dialog = Some(msg);
+            }
+            // Manual update-check state + result.
+            self.checking_update = s.update_checking;
+            if let Some(outcome) = s.update_check.take() {
+                match outcome {
+                    crate::update::CheckOutcome::Available(rel) => self.update_available = Some(rel),
+                    crate::update::CheckOutcome::UpToDate => {
+                        self.dialog = Some(format!(
+                            "You're on the latest version (v{}).",
+                            crate::update::current_version()
+                        ));
+                    }
+                    crate::update::CheckOutcome::Failed(msg) => {
+                        self.dialog = Some(format!("Update check failed:\n\n{msg}"));
+                    }
+                }
             }
         }
     }
@@ -821,6 +846,27 @@ impl State {
             }
             Message::UpdateDismiss => {
                 self.update_available = None;
+                Task::none()
+            }
+            Message::CheckForUpdates => {
+                // Run the check off the UI thread; deliver the outcome via
+                // `shared` for the next tick to surface (modal or a popup).
+                {
+                    let mut s = self.shared.lock().unwrap();
+                    if s.update_checking {
+                        return Task::none();
+                    }
+                    s.update_checking = true;
+                }
+                crate::logging::info("update", "Checking for updates…");
+                let shared = self.shared.clone();
+                std::thread::spawn(move || {
+                    let outcome = crate::update::check_now();
+                    if let Ok(mut s) = shared.lock() {
+                        s.update_check = Some(outcome);
+                        s.update_checking = false;
+                    }
+                });
                 Task::none()
             }
             Message::ConfirmShutdown => {
@@ -2556,12 +2602,34 @@ impl State {
             );
         }
 
+        let updates_section = column![
+            text("Updates").size(16),
+            text(format!("Current version: v{}", crate::update::current_version()))
+                .size(13)
+                .color(grey),
+            {
+                let label = if self.checking_update {
+                    "Checking…"
+                } else {
+                    "Check for updates now"
+                };
+                let b = button(text(label)).padding(8);
+                if self.checking_update {
+                    b
+                } else {
+                    b.on_press(Message::CheckForUpdates)
+                }
+            },
+        ]
+        .spacing(6);
+
         let card = container(
             column![
                 header,
                 horizontal_rule(2),
                 cosmos_section,
                 dev_section,
+                updates_section,
                 pair_section,
                 cleanup_section,
             ]

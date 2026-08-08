@@ -166,6 +166,27 @@ pub fn spawn_checker(shared: Arc<Mutex<Option<Release>>>) {
     });
 }
 
+/// Result of a manual "check for updates now" request.
+pub enum CheckOutcome {
+    /// A newer release is available.
+    Available(Release),
+    /// Already running the latest version.
+    UpToDate,
+    /// The check failed (offline, rate-limited, etc.); carries a short reason.
+    Failed(String),
+}
+
+/// Run a check immediately and classify it against the running version. Unlike
+/// the periodic checker, this always reports a result (for user feedback) and
+/// ignores any skipped-version preference (the user explicitly asked).
+pub fn check_now() -> CheckOutcome {
+    match latest_release() {
+        Ok(rel) if is_newer(&rel.version, current_version()) => CheckOutcome::Available(rel),
+        Ok(_) => CheckOutcome::UpToDate,
+        Err(e) => CheckOutcome::Failed(format!("{e:#}")),
+    }
+}
+
 /// Install a release: download the installer matching this platform/arch and
 /// launch it (the OS installer takes over — a running app can't cleanly replace
 /// itself). If no asset matches, open the release page so the user can pick one.
