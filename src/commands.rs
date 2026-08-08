@@ -111,6 +111,47 @@ pub fn restart(ctx: &Context) -> Result<()> {
     run(ctx)
 }
 
+/// Local files that hold the user's config/secrets (COSMOS 7.3.0+ convention).
+/// They live alongside the replaceable scaffolding and must survive an upgrade.
+const PRESERVE_ON_UPGRADE: [&str; 2] = [".env.local", "compose.override.yaml"];
+
+/// Upgrade the COSMOS install to `tag`: stop COSMOS, replace the cosmos folder
+/// with the new version, then restart. The user's `.env.local` and
+/// `compose.override.yaml` (config + secrets) are carried across the replace;
+/// telemetry/config data lives in Docker volumes and is untouched.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn upgrade_cosmos(ctx: &Context, tag: &str, enterprise: bool, token: &str) -> Result<()> {
+    let cosmos = &ctx.paths.cosmos;
+    install::progress(format!("Upgrading COSMOS to {tag}…"));
+
+    // Read the preserved files into memory before we wipe the folder.
+    let preserved: Vec<(String, Vec<u8>)> = PRESERVE_ON_UPGRADE
+        .iter()
+        .filter_map(|name| std::fs::read(cosmos.join(name)).ok().map(|b| (name.to_string(), b)))
+        .collect();
+
+    install::progress("Stopping COSMOS…");
+    let _ = stop(ctx); // best-effort — it may already be stopped
+
+    install::progress("Replacing the COSMOS install with the new version…");
+    std::fs::remove_dir_all(cosmos)
+        .with_context(|| format!("removing the old COSMOS install at {}", cosmos.display()))?;
+    // With the folder gone, install::cosmos downloads and extracts `tag` fresh.
+    install::cosmos(ctx, tag, enterprise, token)?;
+
+    // Restore the user's config/secrets over the fresh scaffolding.
+    for (name, bytes) in &preserved {
+        std::fs::write(cosmos.join(name), bytes)
+            .with_context(|| format!("restoring {name}"))?;
+        install::progress(format!("Preserved {name}."));
+    }
+
+    install::progress("Starting the upgraded COSMOS…");
+    run(ctx)?;
+    install::progress(format!("COSMOS upgraded to {tag}. It is restarting."));
+    Ok(())
+}
+
 /// Open `url` in the host's default web browser.
 #[cfg(feature = "gui")]
 pub fn open_browser(url: &str) -> Result<()> {

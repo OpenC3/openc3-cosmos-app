@@ -32,7 +32,6 @@ mod download;
 mod enroll;
 mod env_file;
 mod hostfiles;
-mod future;
 mod install;
 mod logging;
 mod monitor;

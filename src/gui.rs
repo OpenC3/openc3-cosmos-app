@@ -285,6 +285,15 @@ struct State {
     update_available: Option<crate::update::Release>,
     /// A manual "Check for updates now" is running (for the Settings button state).
     checking_update: bool,
+    /// Latest newer-than-installed COSMOS release, refreshed by a background
+    /// checker (startup + every 8h). The tick consumes it into `cosmos_update`.
+    cosmos_latest: Arc<Mutex<Option<crate::update::CosmosRelease>>>,
+    /// A newer, non-skipped COSMOS version to prompt the user about (the COSMOS
+    /// update modal, which offers to shut down, replace, and restart COSMOS).
+    cosmos_update: Option<crate::update::CosmosRelease>,
+    /// Live Development-mode flag shared with the COSMOS checker (which skips
+    /// dev mode). Kept in sync as the setting toggles so no restart is needed.
+    cosmos_dev_mode: Arc<AtomicBool>,
 }
 
 /// Start the host microservice operator on a background thread, wiring the
@@ -358,6 +367,12 @@ enum Message {
     UpdateDismiss,
     /// Run a release check immediately (the Settings "Check for updates now").
     CheckForUpdates,
+    /// Shut down COSMOS, replace it with the available new version, and restart.
+    CosmosUpdateInstall,
+    /// Skip the available COSMOS version (don't prompt for it again).
+    CosmosUpdateSkip,
+    /// Dismiss the COSMOS update prompt for now (reappears on the next check).
+    CosmosUpdateDismiss,
     OpenBrowser,
     ShowSettings,
     CloseSettings,
@@ -426,6 +441,19 @@ impl State {
         let update_latest = Arc::new(Mutex::new(None));
         crate::update::spawn_checker(update_latest.clone());
 
+        // Start the background COSMOS-version checker (cosmos-project or
+        // cosmos-enterprise-project tags, per the configured edition). Dev mode
+        // is shared live so toggling it takes effect without a restart.
+        let cosmos_latest = Arc::new(Mutex::new(None));
+        let cosmos_dev_mode = Arc::new(AtomicBool::new(settings.dev_mode));
+        crate::update::spawn_cosmos_checker(
+            cosmos_latest.clone(),
+            ctx.paths.env_file(),
+            settings.edition.is_enterprise(),
+            settings.enterprise_token.clone(),
+            cosmos_dev_mode.clone(),
+        );
+
         Self {
             ctx,
             main_window,
@@ -471,6 +499,9 @@ impl State {
             update_latest,
             update_available: None,
             checking_update: false,
+            cosmos_latest,
+            cosmos_update: None,
+            cosmos_dev_mode,
         }
     }
 
@@ -518,6 +549,10 @@ impl State {
     fn apply_dev_settings(&mut self) {
         self.ctx.dev_folder = dev_folder_from_settings(&self.settings);
         apply_dev_env(self.settings.dev_mode, self.ctx.dev_folder.as_deref());
+        // Keep the COSMOS checker's live dev-mode flag in sync (it skips dev
+        // mode, which runs "latest" from source rather than a tagged install).
+        self.cosmos_dev_mode
+            .store(self.settings.dev_mode, Ordering::Relaxed);
     }
 
     /// Restart the host-microservice operator so it picks up the current context
@@ -652,10 +687,15 @@ impl State {
             self.checking_update = s.update_checking;
             if let Some(outcome) = s.update_check.take() {
                 match outcome {
-                    crate::update::CheckOutcome::Available(rel) => self.update_available = Some(rel),
+                    crate::update::CheckOutcome::AppUpdate(rel) => {
+                        self.update_available = Some(rel)
+                    }
+                    crate::update::CheckOutcome::CosmosUpdate(rel) => {
+                        self.cosmos_update = Some(rel)
+                    }
                     crate::update::CheckOutcome::UpToDate => {
                         self.dialog = Some(format!(
-                            "You're on the latest version (v{}).",
+                            "You're on the latest version (app v{}) and COSMOS is up to date.",
                             crate::update::current_version()
                         ));
                     }
@@ -740,6 +780,24 @@ impl State {
                         });
                         if show {
                             self.update_available = slot.take();
+                        }
+                    }
+                }
+                // Likewise surface a pending COSMOS update, but only when the app
+                // update prompt isn't already showing (one modal at a time). The
+                // checker only stores newer-than-installed releases; honor the skip.
+                if self.page == Page::Main
+                    && !self.settings_open
+                    && self.update_available.is_none()
+                    && self.cosmos_update.is_none()
+                    && self.dialog.is_none()
+                {
+                    if let Ok(mut slot) = self.cosmos_latest.lock() {
+                        let show = slot
+                            .as_ref()
+                            .is_some_and(|rel| rel.version != self.settings.cosmos_skipped_version);
+                        if show {
+                            self.cosmos_update = slot.take();
                         }
                     }
                 }
@@ -848,6 +906,30 @@ impl State {
                 self.update_available = None;
                 Task::none()
             }
+            Message::CosmosUpdateInstall => {
+                if let Some(rel) = self.cosmos_update.take() {
+                    let ctx = self.ctx.clone();
+                    let enterprise = self.settings.edition.is_enterprise();
+                    let token = self.settings.enterprise_token.clone();
+                    let tag = rel.tag.clone();
+                    let label = format!("Upgrading COSMOS to {}", rel.version);
+                    self.spawn(&label, move || {
+                        commands::upgrade_cosmos(&ctx, &tag, enterprise, &token)
+                    });
+                }
+                Task::none()
+            }
+            Message::CosmosUpdateSkip => {
+                if let Some(rel) = self.cosmos_update.take() {
+                    self.settings.cosmos_skipped_version = rel.version;
+                    self.settings.save(&self.ctx);
+                }
+                Task::none()
+            }
+            Message::CosmosUpdateDismiss => {
+                self.cosmos_update = None;
+                Task::none()
+            }
             Message::CheckForUpdates => {
                 // Run the check off the UI thread; deliver the outcome via
                 // `shared` for the next tick to surface (modal or a popup).
@@ -860,8 +942,11 @@ impl State {
                 }
                 crate::logging::info("update", "Checking for updates…");
                 let shared = self.shared.clone();
+                let env_path = self.ctx.paths.env_file();
+                let enterprise = self.settings.edition.is_enterprise();
+                let token = self.settings.enterprise_token.clone();
                 std::thread::spawn(move || {
-                    let outcome = crate::update::check_now();
+                    let outcome = crate::update::check_now(&env_path, enterprise, &token);
                     if let Ok(mut s) = shared.lock() {
                         s.update_check = Some(outcome);
                         s.update_checking = false;
@@ -910,6 +995,22 @@ impl State {
                 self.settings.dev_mode = value;
                 self.apply_dev_settings();
                 self.settings.save(&self.ctx);
+                if value {
+                    // Entering dev mode: drop any pending COSMOS update prompt —
+                    // dev mode runs "latest" from source, not a tagged install.
+                    self.cosmos_update = None;
+                    if let Ok(mut slot) = self.cosmos_latest.lock() {
+                        *slot = None;
+                    }
+                } else {
+                    // Leaving dev mode: recheck now instead of waiting up to 8h.
+                    crate::update::spawn_cosmos_check_once(
+                        self.cosmos_latest.clone(),
+                        self.ctx.paths.env_file(),
+                        self.settings.edition.is_enterprise(),
+                        self.settings.enterprise_token.clone(),
+                    );
+                }
                 Task::none()
             }
             Message::DevFolderChanged(value) => {
@@ -1325,6 +1426,12 @@ impl State {
         } else {
             content
         };
+        // A newer COSMOS version is available — offer Update / Skip / Later.
+        let content = if let Some(rel) = &self.cosmos_update {
+            self.with_cosmos_update_prompt(content, rel)
+        } else {
+            content
+        };
         // Confirm quitting where there's no tray to hide to (Linux).
         if self.quit_confirm {
             self.with_quit_prompt(content)
@@ -1390,6 +1497,78 @@ impl State {
         )
         .padding(24)
         .max_width(460.0)
+        .style(card_style);
+        let overlay = container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(scrim_style);
+        stack![base, opaque(overlay)].into()
+    }
+
+    /// Overlay the "COSMOS update available" modal on `base`. Choosing Update
+    /// shuts COSMOS down, replaces the install with the new version (preserving
+    /// `.env.local` / `compose.override.yaml`), and restarts it.
+    fn with_cosmos_update_prompt<'a>(
+        &self,
+        base: Element<'a, Message>,
+        rel: &crate::update::CosmosRelease,
+    ) -> Element<'a, Message> {
+        fn scrim_style(_theme: &Theme) -> container::Style {
+            container::Style {
+                background: Some(Color::from_rgba8(0, 0, 0, 0.6).into()),
+                ..container::Style::default()
+            }
+        }
+        fn card_style(_theme: &Theme) -> container::Style {
+            container::Style {
+                background: Some(Color::from_rgb8(0x24, 0x24, 0x28).into()),
+                border: iced::border::Border {
+                    color: Color::from_rgb8(0x3A, 0x3A, 0x40),
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..container::Style::default()
+            }
+        }
+        let installed = crate::update::installed_cosmos_version(&self.ctx.paths.env_file())
+            .unwrap_or_else(|| "unknown".to_string());
+        let card = container(
+            column![
+                text("COSMOS update available").size(22),
+                text(format!(
+                    "A new version of COSMOS is available.\n\n\
+                     Installed: v{installed}\nAvailable: v{}\n\n\
+                     Updating shuts COSMOS down, replaces it with the new version, \
+                     and restarts it. Your data (in Docker volumes) and local config \
+                     (.env.local, compose.override.yaml) are preserved.",
+                    rel.version
+                ))
+                .size(15),
+                Space::with_height(8),
+                row![
+                    button(text("Skip this version").size(14))
+                        .padding(10)
+                        .style(button::text)
+                        .on_press(Message::CosmosUpdateSkip),
+                    Space::with_width(Length::Fill),
+                    button(text("Later"))
+                        .padding(10)
+                        .style(button::secondary)
+                        .on_press(Message::CosmosUpdateDismiss),
+                    button(text("Update"))
+                        .padding(10)
+                        .style(button::primary)
+                        .on_press(Message::CosmosUpdateInstall),
+                ]
+                .spacing(10)
+                .align_y(Center),
+            ]
+            .spacing(12),
+        )
+        .padding(24)
+        .max_width(480.0)
         .style(card_style);
         let overlay = container(card)
             .width(Length::Fill)
@@ -2331,8 +2510,31 @@ impl State {
             Space::with_height(0).into()
         };
 
+        // Version subtitle under the title: this app plus the managed COSMOS
+        // version. In dev mode COSMOS runs "latest" from source (the .env tag is
+        // not what's running); for a remote COSMOS there's no local version.
+        let cosmos_version = if !self.settings.run_locally {
+            None
+        } else if self.settings.dev_mode {
+            Some("latest (dev)".to_string())
+        } else {
+            Some(
+                crate::update::installed_cosmos_version(&self.ctx.paths.env_file())
+                    .map(|v| format!("v{v}"))
+                    .unwrap_or_else(|| "not installed".to_string()),
+            )
+        };
+        let version_line = match cosmos_version {
+            Some(c) => format!("App v{}   •   COSMOS {c}", crate::update::current_version()),
+            None => format!("App v{}", crate::update::current_version()),
+        };
+        let version_subtitle = text(version_line)
+            .size(13)
+            .color(Color::from_rgb8(0x9A, 0x9A, 0xA0));
+
         let content = column![
             title,
+            version_subtitle,
             Space::with_height(8),
             open_button,
             Space::with_height(4),
@@ -2602,11 +2804,14 @@ impl State {
             );
         }
 
+        let cosmos_version_line = match crate::update::installed_cosmos_version(&self.ctx.paths.env_file())
+        {
+            Some(v) => format!("App: v{}   COSMOS: v{v}", crate::update::current_version()),
+            None => format!("App: v{}", crate::update::current_version()),
+        };
         let updates_section = column![
             text("Updates").size(16),
-            text(format!("Current version: v{}", crate::update::current_version()))
-                .size(13)
-                .color(grey),
+            text(cosmos_version_line).size(13).color(grey),
             {
                 let label = if self.checking_update {
                     "Checking…"

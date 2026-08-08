@@ -69,6 +69,9 @@ pub struct Settings {
     /// A release version the user chose to skip; the update prompt won't reappear
     /// for it (a newer version still prompts). Empty = nothing skipped.
     pub skipped_version: String,
+    /// A COSMOS version the user chose to skip (same semantics as
+    /// `skipped_version`, but for the COSMOS-itself update prompt).
+    pub cosmos_skipped_version: String,
 }
 
 impl Default for Settings {
@@ -81,6 +84,7 @@ impl Default for Settings {
             dev_mode: false,
             dev_folder: String::new(),
             skipped_version: String::new(),
+            cosmos_skipped_version: String::new(),
         }
     }
 }

@@ -19,13 +19,14 @@
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::process;
 
 /// `owner/repo` to query. Overridable via `OPENC3_APP_GITHUB_REPO` for forks or
-/// testing. Release tags are `openc3-app-v<semver>`.
+/// testing. Release tags are `v<semver>`.
 const DEFAULT_REPO: &str = "OpenC3/openc3-cosmos-app";
 /// Re-check cadence after the initial startup check.
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -122,15 +123,10 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Normalize a release tag to a bare version. Our tags are `openc3-app-v<ver>`;
-/// we also accept `v<ver>` and a plain `<ver>`. (Note: a blind "strip to the
-/// first digit" is wrong — "openc3" contains a digit.)
+/// Normalize a release tag to a bare version. Our tags (and the COSMOS project
+/// tags) are `v<ver>`; a plain `<ver>` is also accepted.
 fn strip_tag(tag: &str) -> String {
     let t = tag.trim();
-    let t = t
-        .strip_prefix("openc3-app-v")
-        .or_else(|| t.strip_prefix("openc3-app-"))
-        .unwrap_or(t);
     t.strip_prefix(['v', 'V']).unwrap_or(t).to_string()
 }
 
@@ -166,25 +162,144 @@ pub fn spawn_checker(shared: Arc<Mutex<Option<Release>>>) {
     });
 }
 
-/// Result of a manual "check for updates now" request.
+/// Result of a manual "check for updates now" request (app + COSMOS).
 pub enum CheckOutcome {
-    /// A newer release is available.
-    Available(Release),
-    /// Already running the latest version.
+    /// A newer version of this app is available.
+    AppUpdate(Release),
+    /// A newer COSMOS version is available.
+    CosmosUpdate(CosmosRelease),
+    /// Everything is up to date.
     UpToDate,
     /// The check failed (offline, rate-limited, etc.); carries a short reason.
     Failed(String),
 }
 
-/// Run a check immediately and classify it against the running version. Unlike
-/// the periodic checker, this always reports a result (for user feedback) and
-/// ignores any skipped-version preference (the user explicitly asked).
-pub fn check_now() -> CheckOutcome {
+/// Run a check immediately (app first, then COSMOS) and classify it. Unlike the
+/// periodic checkers this always reports a result (for user feedback) and ignores
+/// the skipped-version preferences (the user explicitly asked).
+pub fn check_now(cosmos_env: &std::path::Path, enterprise: bool, token: &str) -> CheckOutcome {
     match latest_release() {
-        Ok(rel) if is_newer(&rel.version, current_version()) => CheckOutcome::Available(rel),
-        Ok(_) => CheckOutcome::UpToDate,
-        Err(e) => CheckOutcome::Failed(format!("{e:#}")),
+        Ok(rel) if is_newer(&rel.version, current_version()) => {
+            return CheckOutcome::AppUpdate(rel)
+        }
+        Ok(_) => {}
+        Err(e) => return CheckOutcome::Failed(format!("{e:#}")),
     }
+    match cosmos_check(cosmos_env, enterprise, token) {
+        Some(c) => CheckOutcome::CosmosUpdate(c),
+        None => CheckOutcome::UpToDate,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COSMOS itself (cosmos-project / cosmos-enterprise-project tags)
+// ---------------------------------------------------------------------------
+
+/// A newer COSMOS release available on the appropriate project repo.
+#[derive(Debug, Clone)]
+pub struct CosmosRelease {
+    /// Raw git tag to download (e.g. "v7.3.0").
+    pub tag: String,
+    /// Normalized version for display/compare (e.g. "7.3.0").
+    pub version: String,
+}
+
+const COSMOS_TAGS_API: &str = "https://api.github.com/repos/OpenC3/cosmos-project/tags";
+const COSMOS_ENT_TAGS_API: &str =
+    "https://repos.openc3.com/api/v1/repos/OpenC3/cosmos-enterprise-project/tags";
+
+#[derive(Deserialize)]
+struct GhTag {
+    #[serde(default)]
+    name: String,
+}
+
+/// The highest-semver tag on cosmos-project (Core) or cosmos-enterprise-project
+/// (Enterprise — private Forgejo repo, needs the access token).
+pub fn cosmos_latest(enterprise: bool, token: &str) -> Result<CosmosRelease> {
+    let body = if enterprise {
+        if token.trim().is_empty() {
+            bail!("COSMOS Enterprise update check needs a repos.openc3.com access token");
+        }
+        crate::download::to_bytes_auth(COSMOS_ENT_TAGS_API, token)?
+    } else {
+        fetch(COSMOS_TAGS_API)?
+    };
+    let tags: Vec<GhTag> = serde_json::from_slice(&body)?;
+    tags.into_iter()
+        .map(|t| t.name)
+        .filter(|n| !n.is_empty())
+        .map(|tag| {
+            let version = strip_tag(&tag);
+            (tag, version)
+        })
+        .filter(|(_, v)| !v.is_empty())
+        .max_by(|a, b| triple(&a.1).cmp(&triple(&b.1)))
+        .map(|(tag, version)| CosmosRelease { tag, version })
+        .ok_or_else(|| anyhow::anyhow!("no tags found on the COSMOS project repo"))
+}
+
+/// The installed COSMOS version, from `OPENC3_TAG` in the cosmos `.env`.
+pub fn installed_cosmos_version(env_path: &std::path::Path) -> Option<String> {
+    let map = crate::env_file::parse(env_path).ok()?;
+    map.get("OPENC3_TAG")
+        .map(|v| strip_tag(v))
+        .filter(|v| !v.is_empty())
+}
+
+/// A COSMOS release newer than what's installed, or None (not installed, up to
+/// date, or the check failed).
+pub fn cosmos_check(env_path: &std::path::Path, enterprise: bool, token: &str) -> Option<CosmosRelease> {
+    let installed = installed_cosmos_version(env_path)?;
+    let latest = cosmos_latest(enterprise, token).ok()?;
+    if is_newer(&latest.version, &installed) {
+        Some(latest)
+    } else {
+        None
+    }
+}
+
+/// Periodic COSMOS update checker (startup + every 8h), storing a newer release
+/// in `shared`. Cycles are no-ops when COSMOS isn't installed or in dev mode
+/// (which runs "latest" from source). `dev_mode` is read live each cycle so
+/// toggling Development Mode takes effect without a restart.
+pub fn spawn_cosmos_checker(
+    shared: Arc<Mutex<Option<CosmosRelease>>>,
+    env_path: std::path::PathBuf,
+    enterprise: bool,
+    token: String,
+    dev_mode: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || loop {
+        if !dev_mode.load(Ordering::Relaxed) && env_path.exists() {
+            if let Some(rel) = cosmos_check(&env_path, enterprise, &token) {
+                if let Ok(mut slot) = shared.lock() {
+                    *slot = Some(rel);
+                }
+            }
+        }
+        std::thread::sleep(CHECK_INTERVAL);
+    });
+}
+
+/// Run a single COSMOS check off-thread and publish any newer release into
+/// `shared`. Used to recheck immediately when the user switches out of
+/// Development Mode (rather than waiting for the next periodic cycle).
+pub fn spawn_cosmos_check_once(
+    shared: Arc<Mutex<Option<CosmosRelease>>>,
+    env_path: std::path::PathBuf,
+    enterprise: bool,
+    token: String,
+) {
+    std::thread::spawn(move || {
+        if env_path.exists() {
+            if let Some(rel) = cosmos_check(&env_path, enterprise, &token) {
+                if let Ok(mut slot) = shared.lock() {
+                    *slot = Some(rel);
+                }
+            }
+        }
+    });
 }
 
 /// Install a release: download the installer matching this platform/arch and
@@ -280,8 +395,9 @@ mod tests {
 
     #[test]
     fn tag_prefix_stripping() {
-        assert_eq!(strip_tag("openc3-app-v0.2.0"), "0.2.0");
-        assert_eq!(strip_tag("v1.2.3"), "1.2.3");
+        assert_eq!(strip_tag("v0.2.0"), "0.2.0");
+        assert_eq!(strip_tag("V1.2.3"), "1.2.3");
+        assert_eq!(strip_tag("v7.3.0"), "7.3.0");
         assert_eq!(strip_tag("3.4.5"), "3.4.5");
         assert_eq!(strip_tag(""), "");
     }

@@ -128,8 +128,9 @@ Stored in Redis/Valkey via COSMOS models, scoped per-scope:
   COSMOS-side `bridge_interface`, so the hub can authorize the `stream/<name>`
   leg.
 - **`HostMicroserviceModel`** — the declarative spawn list: `name`, `bridge_name`,
-  `stream`, `config_params`, `options`, `secret_options`, `env`, `container`,
-  `needs_dependencies`, etc. Created from plugin definitions.
+  `stream`, `config_params`, `options`, `protocols` (host-side `BRIDGE_PROTOCOL`s),
+  `secret_options`, `env`, `container`, `needs_dependencies`, etc. Created from
+  plugin definitions.
 - **Secrets store** — the bridge's **private** key, under
   `BRIDGE_<name>_PRIVATE_KEY`. Never leaves COSMOS.
 
@@ -225,10 +226,34 @@ a long-lived data-path secret.
    arrival parks (up to `PAIR_TIMEOUT = 300s`); the second wires
    `_pump(a.recv → b.send)` both directions until either side closes.
 
+### Connection coordination (READY / GO)
+
+The two legs are coordinated so COSMOS never reads from a device that isn't
+actually open, and the host never opens a device COSMOS isn't listening for:
+
+- After the primer, the host leg signals `BRIDGE_READY` (`\x01`) once its real
+  device is open; only then does `bridge_interface` report itself **connected**
+  and reply `BRIDGE_GO` (`\x02`), after which the host begins reading the device.
+  So the COSMOS interface stays `DISCONNECTED` until the host side is genuinely up.
+- **Disconnect propagates both ways.** Disconnecting the `bridge_interface` tears
+  down the host leg (which closes the device); an error/disconnect on the host
+  device drops the COSMOS interface. After a host-side error the host does **not**
+  auto-reconnect — it waits for COSMOS to reconnect the `bridge_interface` and
+  drive a fresh READY/GO cycle.
+
+### Protocols: COSMOS-side vs host-side
+
 Because the stream carries raw bytes with **no framing**, normal COSMOS
 PROTOCOLs (BURST, LENGTH, TERMINATED, …) layer on top in the `bridge_interface`
-config exactly as for any byte-stream interface. Protocols and target
-definitions stay entirely on the COSMOS side; the host only moves bytes.
+config exactly as for any byte-stream interface — target definitions always stay
+on the COSMOS side.
+
+Protocols can additionally run **on the host**, next to the device, via
+**`BRIDGE_PROTOCOL`** lines in the interface config. These are forwarded to
+`host_interface_microservice`, which installs them on the real host interface
+(read/write protocols applied in order) before any bytes cross the bridge. Use
+this when a protocol must act on the raw device timing/framing locally (e.g. a
+handshake) rather than after the network hop.
 
 ---
 
@@ -257,7 +282,9 @@ openc3-app is a single cross-platform binary (Iced GUI + headless CLI). Its
    (`ensure_venv`, prefers `uv`), rebuilt when `pip_fingerprint` changes.
 
 The GUI shows a **bridge status** line ("Connected to COSMOS" / "Not paired…" /
-"COSMOS unreachable…") and a collapsible **Container Status** section.
+"COSMOS unreachable…"), a per-host-interface table with each interface's
+**connection state** and **rx/tx byte** counts, and a collapsible **Container
+Status** section.
 
 ### Log forwarding
 
@@ -279,7 +306,7 @@ with configuration passed via environment:
 |---------|---------|
 | `OPENC3_BRIDGE_TICKET` | Hub ticket to dial |
 | `OPENC3_BRIDGE_CHANNEL` | Stream/interface `<name>` (→ `host/<name>` ALPN) |
-| `OPENC3_HOST_INTERFACE` | JSON `{config_params, options}` for the real interface |
+| `OPENC3_HOST_INTERFACE` | JSON `{config_params, options, protocols}` for the real interface (`protocols` = host-side `BRIDGE_PROTOCOL`s) |
 | `OPENC3_BRIDGE_PRIVATE_KEY` | Ephemeral, openc3-app-minted identity (never persisted) |
 | `OPENC3_MICROSERVICE_NAME` | Name used for logging |
 | `PYTHONPATH` | Synced plugin `lib/` dirs |
@@ -343,16 +370,21 @@ openc3-app start
 
 ## 11. Source map
 
-| Concern | File |
-|---------|------|
-| Hub (server, all ALPNs, rendezvous, control APIs) | `openc3/python/openc3/microservices/bridge_microservice.py` |
-| COSMOS data leg (Python) | `openc3/python/openc3/interfaces/bridge_interface.py` |
-| COSMOS data leg (Ruby) | `openc3/lib/openc3/bridge/bridge_interface_thread.rb` |
-| Host runner | `openc3/python/openc3/microservices/host_interface_microservice.py` |
-| Persistent models | `openc3/python/openc3/models/{bridge_model,bridge_interface_model,host_microservice_model}.py` |
-| Enroll CLI (`bridgeenroll`) | `openc3/bin/openc3cli` |
-| App: enrollment & identity | `openc3-app/src/enroll.rs` |
-| App: hub client (ALPNs, APIs) | `openc3-app/src/bridge.rs` |
-| App: supervision loop | `openc3-app/src/operator.rs` |
-| App: plugin file cache | `openc3-app/src/hostfiles.rs` |
-| App: container status/uptime | `openc3-app/src/monitor.rs` |
+The **COSMOS-side** components (`openc3/...`) live in the **COSMOS Core repo**
+([OpenC3/cosmos](https://github.com/OpenC3/cosmos)); they must change in lockstep
+with the host-side changes here. The **app-side** components (`src/...`) live in
+**this repo** (openc3-cosmos-app).
+
+| Concern | File | Repo |
+|---------|------|------|
+| Hub (server, all ALPNs, rendezvous, control APIs) | `openc3/python/openc3/microservices/bridge_microservice.py` | COSMOS Core |
+| COSMOS data leg (Python) | `openc3/python/openc3/interfaces/bridge_interface.py` | COSMOS Core |
+| COSMOS data leg (Ruby) | `openc3/lib/openc3/bridge/bridge_interface_thread.rb` | COSMOS Core |
+| Host runner | `openc3/python/openc3/microservices/host_interface_microservice.py` | COSMOS Core |
+| Persistent models | `openc3/python/openc3/models/{bridge_model,bridge_interface_model,host_microservice_model}.py` | COSMOS Core |
+| Enroll CLI (`bridgeenroll`) | `openc3/bin/openc3cli` | COSMOS Core |
+| App: enrollment & identity | `src/enroll.rs` | this repo |
+| App: hub client (ALPNs, APIs) | `src/bridge.rs` | this repo |
+| App: supervision loop | `src/operator.rs` | this repo |
+| App: plugin file cache | `src/hostfiles.rs` | this repo |
+| App: container status/uptime | `src/monitor.rs` | this repo |

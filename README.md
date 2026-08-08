@@ -19,10 +19,12 @@ The app provides these functions (see `requirements.md`):
 5. **GUI** — an [Iced](https://iced.rs)-based control panel, on by default, with
    a fully headless mode.
 6. **CLI** — command-line functionality equivalent to `openc3.sh`.
-
-Planned (not yet implemented): supervising host-side Python microservices, and
-an [Iroh](https://iroh.computer) client/server transport to talk to them. See
-`src/future.rs`.
+7. **Host interfaces (the "bridge")** — supervises host-side Python
+   microservices that drive interfaces which must run on the host (serial, USB
+   HID, local-only TCP), tunneling raw device bytes to COSMOS over
+   [Iroh](https://www.iroh.computer/). See [`docs/bridge-architecture.md`](docs/bridge-architecture.md).
+8. **Self-update** — checks GitHub for a newer app release and the COSMOS
+   project for a newer COSMOS version, and can install either from the GUI.
 
 ## Layout
 
@@ -31,9 +33,14 @@ Everything an install needs lives in subfolders of a single application root
 
 ```
 <root>/
-  bin/              downloaded helper tools (uv, ...)
-  python/           isolated Python runtime + venv
-  cosmos/           COSMOS environment (compose.yaml, .env, support dirs)
+  bin/                       downloaded helper tools (uv, ...)
+  python/                    isolated Python runtime + venv
+  cosmos/                    COSMOS environment (compose.yaml, .env, support dirs)
+  bridge/                    control-plane identity (identity.key, current.json)
+  host_files/                synced plugin code for host interfaces
+  microservices/             per-host-interface working dirs + venvs
+  openc3-app-settings.json   persisted GUI settings
+  openc3-app.lock            single-instance guard
 ```
 
 The default root depends on how the app is run:
@@ -77,8 +84,9 @@ openc3 cliroot validate myplugin.gem
 openc3 util hash "my password"
 openc3 util pull 7.0.0
 
-# Upgrade a git-based install
-openc3 upgrade v6.4.1 --preview
+# Host interfaces (the bridge)
+openc3 microservices              # run the host-interface supervisor (headless)
+openc3 bridge-enroll <token>      # pair with a remote COSMOS bridge
 
 # Graphical control panel (also the default with no subcommand)
 openc3 gui
@@ -86,6 +94,25 @@ openc3 gui
 
 Run any command with `--headless` to suppress the GUI, or `--enterprise` to
 treat the install as COSMOS Enterprise.
+
+## GUI control panel
+
+Launched by default (or with `openc3 gui`), the Iced control panel provides:
+
+- **Start / open / shutdown COSMOS** with a live readiness state, plus a
+  **Container Status** table (health, uptime, CPU/memory) read from the Docker
+  socket.
+- **Bridge status** — whether the host-interface bridge is paired and connected,
+  with per-interface connection state and rx/tx byte counts.
+- **Settings** — COSMOS URL, Core vs Enterprise edition (+ enterprise token),
+  run-locally toggle, and **Development Mode** (drive COSMOS from a local source
+  checkout at `latest`).
+- **Self-update** — background checks (startup + every 8h) for a newer app
+  release and a newer COSMOS version, each surfaced as an install prompt; a
+  **Check for updates now** button covers both.
+- **System tray / menu-bar** integration (Windows/macOS) — closing the window
+  hides to the tray; the app runs as a **single instance**. On Linux (no tray)
+  closing prompts to confirm.
 
 ## Building
 
@@ -171,6 +198,15 @@ cargo run -- status             # run a CLI command
 cargo build --no-default-features   # smaller headless-only binary
 ```
 
+### Releasing
+
+Native installers are built by the `.github/workflows/openc3-app-release.yml`
+workflow. Running it via `workflow_dispatch` produces installers as artifacts;
+pushing a **`v<semver>`** tag (matching `version` in `Cargo.toml`) additionally
+attaches them to a GitHub Release. The app's self-update compares that tag
+against its compiled-in `CARGO_PKG_VERSION`.
+
 ## License
 
-AGPL-3.0-only (matching OpenC3 COSMOS Core).
+See [`LICENSE.md`](LICENSE.md) — the OpenC3 Builder's License, or a commercial
+license if purchased from OpenC3, Inc.
