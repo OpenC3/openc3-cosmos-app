@@ -212,13 +212,22 @@ are review-verified only** — call that out and lean on the standard APIs.
 `microservices/` (host-microservice working dirs), `openc3-app-settings.json`,
 `*.profile.json.gz`, `.DS_Store`. See `.gitignore`.
 
+## CI / release
+
+`.github/workflows/openc3-app-release.yml` builds native installers on per-OS
+runners (dmg on macOS, deb+appimage on Linux, WiX msi on Windows) plus a Linux
+`.tar.gz`. `workflow_dispatch` builds artifacts only; pushing an **`openc3-app-v*`**
+tag additionally attaches them to a GitHub Release. It was moved from the COSMOS
+monorepo and de-monorepo'd (no `working-directory: openc3-app`, artifact paths are
+repo-root-relative). Required repo secrets for signed/notarized output (all
+optional — absent → unsigned build):
+- macOS: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+  `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_KEY_P8`.
+- Windows: `AZURE_TS_ENDPOINT`, `AZURE_TS_ACCOUNT`, `AZURE_TS_PROFILE`,
+  `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`.
+
 ## Follow-ups / not yet in this repo
 
-- **CI/release workflow** is NOT here — the old
-  `.github/workflows/openc3-app-release.yml` stayed in the COSMOS monorepo and
-  referenced the `openc3-app/` path. Recreate it here (native runners per OS:
-  dmg on macOS, deb/appimage on Linux, WiX msi on Windows) with the signing
-  secrets (Apple Developer ID + App Store Connect API key; Azure Trusted Signing).
 - No `remote` is configured yet — push when ready.
 - Several bridge/GUI features are **live-untested on Windows/Linux** (see the
   testing caveat); prefer verifying on real hardware before shipping.
