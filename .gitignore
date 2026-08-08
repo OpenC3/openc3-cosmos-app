@@ -6,6 +6,8 @@
 /tmp
 Cargo.lock.bak
 /openc3-app-settings.json
+# Single-instance advisory lock, created at runtime (dev root is the cwd).
+/openc3-app.lock
 # Per-machine runtime state: bridge/identity.key is a private key (secret) and
 # current.json holds a per-run Iroh ticket. Never commit these.
 /bridge
