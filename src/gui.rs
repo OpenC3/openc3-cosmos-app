@@ -274,6 +274,11 @@ struct State {
     /// Single-instance lock held for our lifetime; also lets us poll for a later
     /// launch's request to surface our window.
     singleton: crate::single_instance::Guard,
+    /// Latest GitHub release, refreshed by a background checker (startup + every
+    /// 8h). The tick consumes it into `update_available` when it's newer.
+    update_latest: Arc<Mutex<Option<crate::update::Release>>>,
+    /// A newer, non-skipped release to prompt the user about (the update modal).
+    update_available: Option<crate::update::Release>,
 }
 
 /// Start the host microservice operator on a background thread, wiring the
@@ -339,6 +344,12 @@ enum Message {
     ConfirmQuit,
     /// Dismiss the quit confirmation modal and keep running.
     CancelQuit,
+    /// Download + launch the available update's installer.
+    UpdateInstall,
+    /// Skip the available update's version (don't prompt for it again).
+    UpdateSkip,
+    /// Dismiss the update prompt for now (reappears on the next check).
+    UpdateDismiss,
     OpenBrowser,
     ShowSettings,
     CloseSettings,
@@ -403,6 +414,10 @@ impl State {
 
         crate::logging::info("openc3-app", "OpenC3 COSMOS control panel ready.");
 
+        // Start the background release checker (runs now, then every 8h).
+        let update_latest = Arc::new(Mutex::new(None));
+        crate::update::spawn_checker(update_latest.clone());
+
         Self {
             ctx,
             main_window,
@@ -445,6 +460,8 @@ impl State {
             dialog: None,
             activity: None,
             singleton,
+            update_latest,
+            update_available: None,
         }
     }
 
@@ -684,6 +701,23 @@ impl State {
                         }
                     }
                 }
+                // Surface a pending update on the main page (don't interrupt the
+                // splash/setup flow). Consume it from the shared slot so it shows
+                // once until the next 8h check re-populates it.
+                if self.page == Page::Main
+                    && self.update_available.is_none()
+                    && self.dialog.is_none()
+                {
+                    if let Ok(mut slot) = self.update_latest.lock() {
+                        let show = slot.as_ref().is_some_and(|rel| {
+                            crate::update::is_newer(&rel.version, crate::update::current_version())
+                                && rel.version != self.settings.skipped_version
+                        });
+                        if show {
+                            self.update_available = slot.take();
+                        }
+                    }
+                }
                 // A second launch may have asked us to surface our window (this
                 // covers platforms without a tray poll; tray platforms also catch
                 // it faster in PollTray).
@@ -769,6 +803,24 @@ impl State {
             }
             Message::CancelQuit => {
                 self.quit_confirm = false;
+                Task::none()
+            }
+            Message::UpdateInstall => {
+                if let Some(rel) = self.update_available.take() {
+                    let label = format!("Installing update {}", rel.version);
+                    self.spawn(&label, move || crate::update::install_release(&rel));
+                }
+                Task::none()
+            }
+            Message::UpdateSkip => {
+                if let Some(rel) = self.update_available.take() {
+                    self.settings.skipped_version = rel.version;
+                    self.settings.save(&self.ctx);
+                }
+                Task::none()
+            }
+            Message::UpdateDismiss => {
+                self.update_available = None;
                 Task::none()
             }
             Message::ConfirmShutdown => {
@@ -1221,12 +1273,85 @@ impl State {
         } else {
             content
         };
+        // A newer release is available — offer Install / Skip / Later.
+        let content = if let Some(rel) = &self.update_available {
+            self.with_update_prompt(content, rel)
+        } else {
+            content
+        };
         // Confirm quitting where there's no tray to hide to (Linux).
         if self.quit_confirm {
             self.with_quit_prompt(content)
         } else {
             content
         }
+    }
+
+    /// Overlay the "update available" modal on `base`: shows the installed vs
+    /// available version and offers Install / Skip this version / Later.
+    fn with_update_prompt<'a>(
+        &self,
+        base: Element<'a, Message>,
+        rel: &crate::update::Release,
+    ) -> Element<'a, Message> {
+        fn scrim_style(_theme: &Theme) -> container::Style {
+            container::Style {
+                background: Some(Color::from_rgba8(0, 0, 0, 0.6).into()),
+                ..container::Style::default()
+            }
+        }
+        fn card_style(_theme: &Theme) -> container::Style {
+            container::Style {
+                background: Some(Color::from_rgb8(0x24, 0x24, 0x28).into()),
+                border: iced::border::Border {
+                    color: Color::from_rgb8(0x3A, 0x3A, 0x40),
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..container::Style::default()
+            }
+        }
+        let card = container(
+            column![
+                text("Update available").size(22),
+                text(format!(
+                    "A new version of OpenC3 COSMOS is available.\n\n\
+                     Installed: v{}\nAvailable: v{}",
+                    crate::update::current_version(),
+                    rel.version
+                ))
+                .size(15),
+                Space::with_height(8),
+                row![
+                    button(text("Skip this version").size(14))
+                        .padding(10)
+                        .style(button::text)
+                        .on_press(Message::UpdateSkip),
+                    Space::with_width(Length::Fill),
+                    button(text("Later"))
+                        .padding(10)
+                        .style(button::secondary)
+                        .on_press(Message::UpdateDismiss),
+                    button(text("Install"))
+                        .padding(10)
+                        .style(button::primary)
+                        .on_press(Message::UpdateInstall),
+                ]
+                .spacing(10)
+                .align_y(Center),
+            ]
+            .spacing(12),
+        )
+        .padding(24)
+        .max_width(460.0)
+        .style(card_style);
+        let overlay = container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(scrim_style);
+        stack![base, opaque(overlay)].into()
     }
 
     /// Overlay a "Quit OpenC3 COSMOS?" confirmation on `base`. Shown when the

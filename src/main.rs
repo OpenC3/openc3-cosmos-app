@@ -52,6 +52,9 @@ mod tray;
 #[cfg(feature = "gui")]
 mod single_instance;
 
+#[cfg(feature = "gui")]
+mod update;
+
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Command, InstallTarget};

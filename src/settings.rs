@@ -66,6 +66,9 @@ pub struct Settings {
     pub dev_mode: bool,
     /// The local source checkout used in development mode (contains `openc3.sh`).
     pub dev_folder: String,
+    /// A release version the user chose to skip; the update prompt won't reappear
+    /// for it (a newer version still prompts). Empty = nothing skipped.
+    pub skipped_version: String,
 }
 
 impl Default for Settings {
@@ -77,6 +80,7 @@ impl Default for Settings {
             enterprise_token: String::new(),
             dev_mode: false,
             dev_folder: String::new(),
+            skipped_version: String::new(),
         }
     }
 }
