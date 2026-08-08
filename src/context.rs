@@ -35,7 +35,7 @@ impl Paths {
     pub fn resolve(root_override: Option<PathBuf>) -> Result<Self> {
         let root = match root_override {
             Some(r) => r,
-            None => match std::env::var_os("OPENC3_APP_HOME") {
+            None => match std::env::var_os("OPENC3_COSMOS_APP_HOME") {
                 Some(v) => PathBuf::from(v),
                 None => default_root()?,
             },

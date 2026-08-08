@@ -18,7 +18,7 @@ instead — bold white "COS" over "MOS" on the brand-blue rounded square — whi
 stays legible and high-contrast at tray size on any taskbar theme. Output ->
 assets/tray.png, loaded by src/tray.rs.
 
-Run from the openc3-app directory:
+Run from the openc3-cosmos-app directory:
 
     uv run --with pillow python tools/gen_tray_icon.py
 

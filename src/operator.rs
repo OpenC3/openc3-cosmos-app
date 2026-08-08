@@ -133,8 +133,8 @@ pub struct MicroserviceStatus {
     pub txbytes: Option<u64>,
 }
 
-/// Health of openc3-app's connection to the COSMOS bridge hub, published for
-/// the GUI. `configured` means openc3-app is paired (has an identity + a bridge
+/// Health of openc3-cosmos-app's connection to the COSMOS bridge hub, published for
+/// the GUI. `configured` means openc3-cosmos-app is paired (has an identity + a bridge
 /// ticket); `connected` means the most recent hub API call succeeded.
 #[allow(dead_code)] // fields read by the GUI, not the headless binary
 #[derive(Clone, Debug, Default)]
@@ -601,7 +601,7 @@ pub struct MicroserviceOperator {
     host_keys: BTreeMap<String, (String, String)>,
     /// Published health of the connection to the COSMOS bridge hub (for the GUI).
     bridge_status: Arc<Mutex<BridgeConnectionStatus>>,
-    /// Short reason openc3-app isn't paired (no bridge client), shown in the GUI.
+    /// Short reason openc3-cosmos-app isn't paired (no bridge client), shown in the GUI.
     unpaired_reason: Option<String>,
     /// Called to (re)establish the bridge connection while unpaired.
     bridge_connector: Option<BridgeConnector>,
@@ -1401,7 +1401,7 @@ fn host_specs_to_configs(specs: Vec<HostSpec>) -> ConfigMap {
         let mut env = spec.env.clone();
         env.insert("OPENC3_HOST_INTERFACE".to_string(), host_interface);
         // The host has no COSMOS Redis; the Logger writes JSON to stdout only
-        // (openc3-app forwards it up to COSMOS via api/log).
+        // (openc3-cosmos-app forwards it up to COSMOS via api/log).
         env.insert("OPENC3_NO_STORE".to_string(), "1".to_string());
         let config = MicroserviceConfig {
             python: true,

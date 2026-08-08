@@ -194,7 +194,7 @@ fn run(cli: Cli) -> Result<()> {
                 ctx.paths.python.clone(),
                 ctx.paths.microservices.clone(),
             );
-            // openc3-app is a client of the COSMOS bridge_microservice hub. It
+            // openc3-cosmos-app is a client of the COSMOS bridge_microservice hub. It
             // uses its own persistent identity and enrolls (auto over local
             // Docker, or via a configured ticket) to obtain the hub ticket.
             // Auto-enroll happens in the operator loop once COSMOS has been up a

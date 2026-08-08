@@ -9,7 +9,7 @@
 // This file may also be used under the terms of a commercial license
 // if purchased from OpenC3, Inc.
 
-//! Structured JSON logging that matches the COSMOS logger format so openc3-app's
+//! Structured JSON logging that matches the COSMOS logger format so openc3-cosmos-app's
 //! output is consistent with the rest of the system.
 //!
 //! Mirrors `build_log_data` in `openc3/lib/openc3/utilities/logger.rb`: every

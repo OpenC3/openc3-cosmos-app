@@ -264,7 +264,7 @@ pub enum CosmosReadiness {
     /// short reason.
     DockerUnavailable(String),
     /// Docker is reachable but no COSMOS containers exist for the compose context
-    /// openc3-app is pointed at (wrong project, Development-mode folder, or a
+    /// openc3-cosmos-app is pointed at (wrong project, Development-mode folder, or a
     /// remote COSMOS that needs manual token pairing).
     NoContainers,
     /// COSMOS containers exist but none are running (stopped / exited / restarting).

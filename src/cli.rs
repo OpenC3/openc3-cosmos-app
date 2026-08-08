@@ -30,7 +30,7 @@ use std::path::PathBuf;
 pub struct Cli {
     /// Application root directory. Installed components (python/, cosmos/, bin/)
     /// live in subfolders here. Defaults to the directory containing the
-    /// executable, overridable with OPENC3_APP_HOME.
+    /// executable, overridable with OPENC3_COSMOS_APP_HOME.
     #[arg(long, global = true, value_name = "DIR")]
     pub root: Option<PathBuf>,
 

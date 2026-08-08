@@ -11,14 +11,14 @@
 
 //! Iroh client to the COSMOS `bridge_microservice` hub.
 //!
-//! openc3-app does not run its own Iroh server. It is a **client** of the
+//! openc3-cosmos-app does not run its own Iroh server. It is a **client** of the
 //! COSMOS-side `bridge_microservice` (the hub), dialing it with a configured
 //! bridge ticket, and uses control APIs over dedicated ALPNs:
 //!
 //! * `api/host_microservices` — poll the list of host microservices to spawn.
 //! * `api/log` — forward host microservice stdout up so COSMOS logs it too.
 //!
-//! The raw interface data path does NOT flow through openc3-app: each spawned
+//! The raw interface data path does NOT flow through openc3-cosmos-app: each spawned
 //! host interface dials the hub directly on `stream/<name>` and is paired there
 //! with the matching COSMOS `bridge_interface`.
 
@@ -43,7 +43,7 @@ const API_AUTHORIZE: &[u8] = b"api/authorize";
 /// ALPN for syncing the scope's plugin files (lib/, requirements, pyproject).
 const API_FILES: &[u8] = b"api/files";
 /// ALPN for fetching host InterfaceStatus (tapped by the hub from the control
-/// channel), so openc3-app can show host interface status in its bridge section.
+/// channel), so openc3-cosmos-app can show host interface status in its bridge section.
 const API_INTERFACE_STATUS: &[u8] = b"api/interface_status";
 /// Upper bound on a small API response we will read.
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
@@ -51,7 +51,7 @@ const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 512 * 1024 * 1024;
 
 /// One file in a plugin-file sync delta. `content` is base64 (standard). The
-/// hub also sends a `sha256` (ignored here — openc3-app re-hashes from disk on
+/// hub also sends a `sha256` (ignored here — openc3-cosmos-app re-hashes from disk on
 /// the next sync to build its manifest).
 #[derive(Debug, Deserialize)]
 pub struct FileEntry {
@@ -90,7 +90,7 @@ fn relay_mode_from_env() -> RelayMode {
 }
 
 /// Mint a fresh Iroh identity for a host microservice. Returns
-/// `(secret_key_hex, public_key_hex)`. openc3-app hands the secret to the child
+/// `(secret_key_hex, public_key_hex)`. openc3-cosmos-app hands the secret to the child
 /// and never persists it; the public key is authorized with the hub.
 pub fn generate_host_key() -> (String, String) {
     let secret = SecretKey::generate();
@@ -106,7 +106,7 @@ pub fn generate_host_key() -> (String, String) {
 }
 
 /// Redeem a manual enrollment `code` with the hub over the `api/enroll` ALPN,
-/// using `secret_key` as openc3-app's identity — which the hub records as the
+/// using `secret_key` as openc3-cosmos-app's identity — which the hub records as the
 /// authorized control key on success. One-shot; binds a temporary endpoint.
 pub fn enroll(secret_key: SecretKey, bridge_ticket: &str, code: &str) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -153,7 +153,7 @@ pub fn enroll(secret_key: SecretKey, bridge_ticket: &str, code: &str) -> Result<
     })
 }
 
-/// One host microservice openc3-app should spawn, as described by COSMOS via the
+/// One host microservice openc3-cosmos-app should spawn, as described by COSMOS via the
 /// `api/host_microservices` API. Only the fields the launcher needs are typed;
 /// `config_params`/`options` are forwarded to the host runner as opaque JSON.
 #[derive(Debug, Clone, Deserialize)]
@@ -176,7 +176,7 @@ pub struct HostSpec {
 }
 
 /// A host interface's status, as reported over the control channel and tapped by
-/// the hub. Only the fields openc3-app displays are captured; the rest is ignored.
+/// the hub. Only the fields openc3-cosmos-app displays are captured; the rest is ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct InterfaceStatus {
     /// The host microservice name, used to match this status to a microservice.
@@ -201,7 +201,7 @@ pub struct BridgeClient {
 
 impl BridgeClient {
     /// Connect to the hub identified by `bridge_ticket` (its `EndpointTicket`),
-    /// using `secret_key` as openc3-app's control identity so the hub can verify
+    /// using `secret_key` as openc3-cosmos-app's control identity so the hub can verify
     /// it. Binds a local Iroh endpoint and starts the background log forwarder.
     pub fn connect(secret_key: SecretKey, bridge_ticket: &str) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()

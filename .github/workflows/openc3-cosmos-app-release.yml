@@ -13,7 +13,7 @@
 # needs macOS and a .msi/WiX needs Windows). Run it manually (workflow_dispatch)
 # to build without publishing — installers land as artifacts; pushing a
 # `v*` tag additionally attaches them to a GitHub Release.
-name: openc3-app Release Packages
+name: openc3-cosmos-app Release Packages
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: openc3-app-release-${{ github.ref }}
+  group: openc3-cosmos-app-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -304,7 +304,7 @@ jobs:
       - name: Upload installers
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: openc3-app-${{ matrix.name }}
+          name: openc3-cosmos-app-${{ matrix.name }}
           # Exclude the loose .app bundle cargo-packager leaves beside the .dmg:
           # a .app inside the artifact zip loses its code signature (the sealed
           # CodeResources), so it fails Gatekeeper. Ship the .dmg, which keeps
@@ -328,7 +328,7 @@ jobs:
           egress-policy: audit
 
       - name: Download the linux-x86_64 installers
-        run: gh run download "$GITHUB_RUN_ID" -n openc3-app-linux-x86_64 --dir pkg
+        run: gh run download "$GITHUB_RUN_ID" -n openc3-cosmos-app-linux-x86_64 --dir pkg
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -382,7 +382,7 @@ jobs:
           files=$(find artifacts -type f)
           echo "Attaching:"; echo "$files"
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "openc3-app $GITHUB_REF_NAME" --generate-notes
+            || gh release create "$GITHUB_REF_NAME" --title "openc3-cosmos-app $GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" $files --clobber
         env:
           GH_TOKEN: ${{ github.token }}

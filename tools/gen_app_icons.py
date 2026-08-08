@@ -18,7 +18,7 @@ Composites the raw OpenC3 mark (assets/logo.png) onto a brand-colored rounded
 (macOS only). Results live in assets/icons/ and are referenced by
 `[package.metadata.packager].icons` in Cargo.toml.
 
-Run from the openc3-app directory:
+Run from the openc3-cosmos-app directory:
 
     uv run --with pillow python tools/gen_app_icons.py
 

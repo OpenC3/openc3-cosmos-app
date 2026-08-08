@@ -297,7 +297,7 @@ struct State {
 }
 
 /// Start the host microservice operator on a background thread, wiring the
-/// bridge client. openc3-app is a client of the COSMOS bridge_microservice hub;
+/// bridge client. openc3-cosmos-app is a client of the COSMOS bridge_microservice hub;
 /// [`crate::enroll::connect_bridge`] resolves its identity and the hub ticket
 /// (auto-enrolling co-located, or using a previously redeemed manual token).
 type OperatorHandles = (
@@ -435,7 +435,7 @@ impl State {
         let (operator_status, bridge_status_handle, operator_shutdown, operator_thread) =
             start_operator(&ctx, bridge_retry.clone());
 
-        crate::logging::info("openc3-app", "OpenC3 COSMOS control panel ready.");
+        crate::logging::info("openc3-cosmos-app", "OpenC3 COSMOS control panel ready.");
 
         // Start the background release checker (runs now, then every 8h).
         let update_latest = Arc::new(Mutex::new(None));
@@ -963,7 +963,7 @@ impl State {
             Message::OpenBrowser => {
                 let url = self.settings.effective_cosmos_url().to_string();
                 if let Err(e) = commands::open_browser(&url) {
-                    crate::logging::error("openc3-app", &format!("Failed to open browser: {e}"));
+                    crate::logging::error("openc3-cosmos-app", &format!("Failed to open browser: {e}"));
                 }
                 Task::none()
             }
@@ -1300,19 +1300,19 @@ impl State {
         {
             let mut s = self.shared.lock().unwrap();
             if s.busy {
-                crate::logging::warn("openc3-app", "A task is already running; please wait.");
+                crate::logging::warn("openc3-cosmos-app", "A task is already running; please wait.");
                 return;
             }
             s.busy = true;
         }
-        crate::logging::info("openc3-app", &format!("{label}..."));
+        crate::logging::info("openc3-cosmos-app", &format!("{label}..."));
         let shared = self.shared.clone();
         std::thread::spawn(move || {
             // Mirror install progress into the log (stdout + the in-app table)
             // and record the latest line as the live busy-indicator status.
             let activity_shared = shared.clone();
             install::set_notifier(Box::new(move |m| {
-                crate::logging::info("openc3-app", &m);
+                crate::logging::info("openc3-cosmos-app", &m);
                 if let Ok(mut s) = activity_shared.lock() {
                     s.activity = Some(m);
                 }
@@ -1329,8 +1329,8 @@ impl State {
             install::clear_notifier();
             install::clear_dialog_notifier();
             match result {
-                Ok(()) => crate::logging::info("openc3-app", &format!("{label}: done.")),
-                Err(e) => crate::logging::error("openc3-app", &format!("{label}: ERROR: {e}")),
+                Ok(()) => crate::logging::info("openc3-cosmos-app", &format!("{label}: done.")),
+                Err(e) => crate::logging::error("openc3-cosmos-app", &format!("{label}: ERROR: {e}")),
             }
             if let Ok(mut s) = shared.lock() {
                 s.busy = false;
@@ -1345,15 +1345,15 @@ impl State {
         {
             let mut s = self.shared.lock().unwrap();
             if s.busy {
-                crate::logging::warn("openc3-app", "A task is already running; please wait.");
+                crate::logging::warn("openc3-cosmos-app", "A task is already running; please wait.");
                 return;
             }
             s.busy = true;
         }
-        crate::logging::info("openc3-app", "Enabling Windows features...");
+        crate::logging::info("openc3-cosmos-app", "Enabling Windows features...");
         let shared = self.shared.clone();
         std::thread::spawn(move || {
-            install::set_notifier(Box::new(|m| crate::logging::info("openc3-app", &m)));
+            install::set_notifier(Box::new(|m| crate::logging::info("openc3-cosmos-app", &m)));
             let dialog_shared = shared.clone();
             install::set_dialog_notifier(Box::new(move |m| {
                 if let Ok(mut s) = dialog_shared.lock() {
@@ -1364,8 +1364,8 @@ impl State {
             install::clear_notifier();
             install::clear_dialog_notifier();
             match &result {
-                Ok(()) => crate::logging::info("openc3-app", "Enabling Windows features: done."),
-                Err(e) => crate::logging::error("openc3-app", &format!("Enabling Windows features: ERROR: {e}")),
+                Ok(()) => crate::logging::info("openc3-cosmos-app", "Enabling Windows features: done."),
+                Err(e) => crate::logging::error("openc3-cosmos-app", &format!("Enabling Windows features: ERROR: {e}")),
             }
             if let Ok(mut s) = shared.lock() {
                 s.busy = false;
@@ -2559,7 +2559,7 @@ impl State {
     }
 
     /// Scrolling log messages table (replaces the old Activity panel). Shows
-    /// everything openc3-app logs to stdout, newest first, filterable by level
+    /// everything openc3-cosmos-app logs to stdout, newest first, filterable by level
     /// and search, with pause/clear. Modeled on COSMOS' LogMessages.vue.
     fn view_log_messages(&self) -> Element<'_, Message> {
         let header_color = Color::from_rgb8(0x9E, 0x9E, 0x9E);
@@ -3141,7 +3141,7 @@ pub fn launch(root_override: Option<PathBuf>, enterprise: bool) -> anyhow::Resul
     let guard = match crate::single_instance::acquire(&root) {
         crate::single_instance::Acquire::Secondary => {
             crate::logging::info(
-                "openc3-app",
+                "openc3-cosmos-app",
                 "OpenC3 COSMOS is already running; brought its window to the front.",
             );
             return Ok(());

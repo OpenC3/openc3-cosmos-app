@@ -330,7 +330,7 @@ fn install_docker_linux() -> Result<()> {
 }
 
 /// Add the invoking user to the `docker` group so Docker can be used without
-/// sudo. openc3-app itself then reaches Docker via `sg docker` (see
+/// sudo. openc3-cosmos-app itself then reaches Docker via `sg docker` (see
 /// docker.rs::group) so it works in this session without an app restart; a
 /// plain login shell picks up the group on next login (or `newgrp docker`).
 fn add_user_to_docker_group() {
@@ -348,7 +348,7 @@ fn add_user_to_docker_group() {
     let script = format!("groupadd -f docker && usermod -aG docker {}", shell_single_quote(&user));
     match run_root_shell(&script) {
         Ok(()) => notify(format!(
-            "Docker installed and '{user}' added to the docker group. openc3-app will try to use \
+            "Docker installed and '{user}' added to the docker group. openc3-cosmos-app will try to use \
              Docker in this session automatically. For a plain terminal, run `newgrp docker` or \
              start a new login session.",
         )),

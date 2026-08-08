@@ -9,21 +9,21 @@
 // This file may also be used under the terms of a commercial license
 // if purchased from OpenC3, Inc.
 
-//! openc3-app's control-plane identity and one-time enrollment with a bridge.
+//! openc3-cosmos-app's control-plane identity and one-time enrollment with a bridge.
 //!
-//! openc3-app authenticates to the COSMOS `bridge_microservice` hub with its own
+//! openc3-cosmos-app authenticates to the COSMOS `bridge_microservice` hub with its own
 //! persistent Iroh identity. Only its **public** `EndpointId` ever leaves the
 //! host; the private key is stored locally under `<root>/bridge/`.
 //!
 //! Enrollment is one-time and yields the hub ticket, persisted in
-//! `<root>/bridge/current.json` (openc3-app pairs with a single bridge). Two
+//! `<root>/bridge/current.json` (openc3-cosmos-app pairs with a single bridge). Two
 //! paths:
-//! * **Auto** (co-located, default): openc3-app reaches COSMOS over the trusted
+//! * **Auto** (co-located, default): openc3-cosmos-app reaches COSMOS over the trusted
 //!   local Docker control plane and runs the `bridgeenroll` CLI to register its
 //!   public key and read back the hub ticket. That local access is the
 //!   out-of-band trust anchor that makes zero-touch pairing secure.
 //! * **Manual** (remote COSMOS): the user pastes an enrollment token (generated
-//!   on the COSMOS Admin → Bridges page) into openc3-app; [`enroll_with_token`]
+//!   on the COSMOS Admin → Bridges page) into openc3-cosmos-app; [`enroll_with_token`]
 //!   redeems its one-time code over the hub's `api/enroll` ALPN.
 
 use anyhow::{bail, Context as _, Result};
@@ -36,7 +36,7 @@ use crate::bridge::{self, BridgeClient};
 use crate::context::Context;
 use crate::docker;
 
-/// The bridge openc3-app is currently paired with, persisted across launches.
+/// The bridge openc3-cosmos-app is currently paired with, persisted across launches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Current {
     bridge: String,
@@ -108,8 +108,8 @@ fn decode_key(s: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Load openc3-app's persisted Iroh identity, generating and saving one on first
-/// use. openc3-app persists its OWN private key here (unlike the ephemeral keys
+/// Load openc3-cosmos-app's persisted Iroh identity, generating and saving one on first
+/// use. openc3-cosmos-app persists its OWN private key here (unlike the ephemeral keys
 /// it later mints for host microservices).
 fn load_or_create_secret(root: &Path) -> Result<SecretKey> {
     let path = identity_path(root);
@@ -128,7 +128,7 @@ fn load_or_create_secret(root: &Path) -> Result<SecretKey> {
     Ok(secret)
 }
 
-/// openc3-app's public identity as hex (its Iroh `EndpointId`).
+/// openc3-cosmos-app's public identity as hex (its Iroh `EndpointId`).
 fn public_key_hex(secret: &SecretKey) -> String {
     hex(secret.public().as_bytes())
 }
@@ -208,7 +208,7 @@ fn resolve_ticket(ctx: &Context, app_public_key_hex: &str) -> Result<String, Str
     Ok(ticket)
 }
 
-/// Register openc3-app's public key with COSMOS and read back the hub ticket by
+/// Register openc3-cosmos-app's public key with COSMOS and read back the hub ticket by
 /// running the `bridgeenroll` CLI in the cmd-tlm-api container (local Docker).
 fn auto_enroll(ctx: &Context, bridge_name: &str, app_public_key_hex: &str) -> Result<String> {
     let mut cmd = docker::compose(ctx)?;
@@ -238,7 +238,7 @@ fn auto_enroll(ctx: &Context, bridge_name: &str, app_public_key_hex: &str) -> Re
 
 /// Redeem a manual enrollment token (from the COSMOS Admin Bridges page) for a
 /// remote COSMOS. Decodes the token, redeems its one-time code over the hub's
-/// `api/enroll` ALPN using openc3-app's identity, and persists the pairing.
+/// `api/enroll` ALPN using openc3-cosmos-app's identity, and persists the pairing.
 /// Returns the bridge name on success.
 pub fn enroll_with_token(ctx: &Context, token: &str) -> Result<String> {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -253,12 +253,12 @@ pub fn enroll_with_token(ctx: &Context, token: &str) -> Result<String> {
     Ok(parsed.bridge)
 }
 
-/// Load/create openc3-app's identity, resolve the hub ticket (enrolling if
+/// Load/create openc3-cosmos-app's identity, resolve the hub ticket (enrolling if
 /// needed), and connect a [`BridgeClient`]. Returns `(hub_ticket, client)`, or
 /// `None` if no bridge is configured or the connection fails. The returned
 /// ticket is what host microservices use (via `OPENC3_BRIDGE_TICKET`) to dial
 /// the hub for the data path.
-/// On failure returns a short human reason (shown in the GUI) for why openc3-app
+/// On failure returns a short human reason (shown in the GUI) for why openc3-cosmos-app
 /// isn't paired with COSMOS.
 pub fn connect_bridge(ctx: &Context) -> Result<(String, BridgeClient), String> {
     let secret = load_or_create_secret(&ctx.paths.root).map_err(|e| {

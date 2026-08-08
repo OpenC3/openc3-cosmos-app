@@ -13,7 +13,7 @@
 //!
 //! Launching the app again should not spin up a second copy (another tray icon,
 //! another operator); instead it should surface the already-running window. The
-//! token is an **advisory lock** on a per-user file (`<root>/openc3-app.lock`):
+//! token is an **advisory lock** on a per-user file (`<root>/openc3-cosmos-app.lock`):
 //!
 //! * The first instance takes an exclusive lock and holds it for its lifetime.
 //! * A later launch fails to take the lock, drops a one-byte "show request"
@@ -35,8 +35,8 @@ use fs4::fs_std::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-const LOCK_FILE: &str = "openc3-app.lock";
-const SHOW_FILE: &str = "openc3-app.show";
+const LOCK_FILE: &str = "openc3-cosmos-app.lock";
+const SHOW_FILE: &str = "openc3-cosmos-app.show";
 
 /// Outcome of trying to become the single instance.
 pub enum Acquire {
@@ -86,7 +86,7 @@ pub fn acquire(root: &Path) -> Acquire {
         Err(e) => {
             // Can't even open the lock file — fail open (run) rather than block.
             crate::logging::warn(
-                "openc3-app",
+                "openc3-cosmos-app",
                 &format!("single-instance lock unavailable ({e}); launching without the guard"),
             );
             return Acquire::Primary(Guard { _lock: None, marker });
@@ -108,7 +108,7 @@ pub fn acquire(root: &Path) -> Acquire {
             // Locking errored (e.g. a filesystem that doesn't support it) — fail
             // open so we still launch.
             crate::logging::warn(
-                "openc3-app",
+                "openc3-cosmos-app",
                 &format!("single-instance lock error ({e}); launching without the guard"),
             );
             Acquire::Primary(Guard { _lock: Some(file), marker })

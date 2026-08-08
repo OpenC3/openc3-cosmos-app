@@ -82,7 +82,7 @@ together; the Rust side here is only the middle relay + host-process supervisor.
 - `gui.rs` — the entire iced app (pages: Splash/Install/Main, modals, tray).
 - `tray.rs` — system-tray/menu-bar icon + Dock-visibility (macOS).
 - `single_instance.rs` — single-instance guard (file lock) + "show existing window".
-- `settings.rs` — persisted settings (`openc3-app-settings.json`).
+- `settings.rs` — persisted settings (`openc3-cosmos-app-settings.json`).
 - `process.rs` — subprocess helpers (`run`, `capture`, `run_streamed`, `no_window`).
 - `download.rs` — curl/wget wrappers.
 - `env_file.rs`, `logging.rs`, `util.rs` — support.
@@ -107,7 +107,7 @@ device  <->  host_interface_microservice (host, spawned by this app's operator)
   until the host is ready, and the host won't touch hardware until COSMOS is up.
 - **Control channel**: COSMOS sends connect/disconnect (coalesced on the host to
   the net final state to avoid replaying a backlog); the host pushes live
-  `InterfaceStatus` up, surfaced in CmdTlmServer and openc3-app.
+  `InterfaceStatus` up, surfaced in CmdTlmServer and openc3-cosmos-app.
 - **BRIDGE_PROTOCOL**: protocols declared `BRIDGE_PROTOCOL` run on the *host*
   (next to the device); plain `PROTOCOL`s run in COSMOS on `bridge_interface`.
 - Host errors → host disconnects and **parks** (does not auto-reconnect); COSMOS
@@ -173,11 +173,11 @@ are review-verified only** — call that out and lean on the standard APIs.
   pulls) is streamed live via `process::run_streamed(cmd, |line| install::progress(line))`,
   and the GUI shows a spinner + latest line while `busy`.
 - **Single instance** (`single_instance.rs`): an **advisory file lock** on
-  `<root>/openc3-app.lock` (chosen over a fixed TCP port — no collision, OS
-  releases on crash). A second launch drops an `openc3-app.show` marker and exits;
+  `<root>/openc3-cosmos-app.lock` (chosen over a fixed TCP port — no collision, OS
+  releases on crash). A second launch drops an `openc3-cosmos-app.show` marker and exits;
   the running app polls it and raises its window. Fail-open if locking errors.
 - **Self-update** (`update.rs`, GUI-only): a background thread checks the GitHub
-  Releases API (`DEFAULT_REPO`, overridable via `OPENC3_APP_GITHUB_REPO`) on
+  Releases API (`DEFAULT_REPO`, overridable via `OPENC3_COSMOS_APP_GITHUB_REPO`) on
   startup and every 8h, storing the latest `Release` in a shared slot. The Main
   page's tick surfaces an **Update available** modal when the release is newer
   than `env!("CARGO_PKG_VERSION")` and isn't the `settings.skipped_version`.
@@ -218,7 +218,7 @@ are review-verified only** — call that out and lean on the standard APIs.
   `monitor.rs` falls back to `docker compose ps`/`stats` if the socket is
   unreachable. Health: a one-shot container that **exited 0** (e.g.
   `openc3-cosmos-init`) counts as healthy — see `ContainerStatus::is_healthy`.
-- **Settings** (`settings.rs`): `openc3-app-settings.json` in the app root
+- **Settings** (`settings.rs`): `openc3-cosmos-app-settings.json` in the app root
   (gitignored — contains the enterprise access token; rotate if it leaks).
   Includes `cosmos_url`, `run_locally`, `edition`, `enterprise_token`, `dev_mode`,
   `dev_folder`.
@@ -239,16 +239,16 @@ are review-verified only** — call that out and lean on the standard APIs.
 
 `target/`, `dist/`, `python/` (venv), `cosmos/` (COSMOS install), `bin/`,
 `bridge/` (contains `identity.key` — a private key), `host_files/`,
-`microservices/` (host-microservice working dirs), `openc3-app-settings.json`,
+`microservices/` (host-microservice working dirs), `openc3-cosmos-app-settings.json`,
 `*.profile.json.gz`, `.DS_Store`. See `.gitignore`.
 
 ## CI / release
 
-`.github/workflows/openc3-app-release.yml` builds native installers on per-OS
+`.github/workflows/openc3-cosmos-app-release.yml` builds native installers on per-OS
 runners (dmg on macOS, deb+appimage on Linux, WiX msi on Windows) plus a Linux
 `.tar.gz`. `workflow_dispatch` builds artifacts only; pushing a **`v*`**
 tag additionally attaches them to a GitHub Release. It was moved from the COSMOS
-monorepo and de-monorepo'd (no `working-directory: openc3-app`, artifact paths are
+monorepo and de-monorepo'd (no `working-directory: openc3-cosmos-app`, artifact paths are
 repo-root-relative). Required repo secrets for signed/notarized output (all
 optional — absent → unsigned build):
 - macOS: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,

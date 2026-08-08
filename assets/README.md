@@ -1,4 +1,4 @@
-# openc3-app assets
+# openc3-cosmos-app assets
 
 ## openc3-icons.ttf
 

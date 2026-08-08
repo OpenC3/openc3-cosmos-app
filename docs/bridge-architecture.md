@@ -14,7 +14,7 @@ processes, authorizing identities, forwarding logs, and shipping plugin code.
 ```
    ┌─────────────────────── COSMOS (Docker) ───────────────────────┐        ┌──────────── Host machine ────────────┐
    │                                                                │        │                                       │
-   │   bridge_interface ──stream/<name>──┐                          │        │   openc3-app (Rust launcher)          │
+   │   bridge_interface ──stream/<name>──┐                          │        │   openc3-cosmos-app (Rust launcher)          │
    │   (a normal COSMOS Interface)       │                          │        │     • control-plane client of the hub │
    │                                     ▼                          │        │     • spawns + supervises host procs  │
    │                          bridge_microservice  ◀───api/*────────┼────────┼──▶  │                                  │
@@ -30,10 +30,10 @@ processes, authorizing identities, forwarding logs, and shipping plugin code.
 |-----------|-------|----------|------|
 | **`bridge_interface`** | COSMOS container | Ruby / Python | A regular COSMOS `Interface`. The COSMOS end of the byte pipe. |
 | **`bridge_microservice`** | COSMOS container | Python | The **single Iroh server** ("hub"). Rendezvous for the data path + all control APIs. |
-| **`openc3-app`** | Host | Rust | Native launcher/manager. Control-plane **client** of the hub; spawns and supervises host microservices. |
+| **`openc3-cosmos-app`** | Host | Rust | Native launcher/manager. Control-plane **client** of the hub; spawns and supervises host microservices. |
 | **`host_interface_microservice`** | Host | Python | One per bridged interface. Opens the real device and tunnels raw bytes to the hub. |
 
-Key design decision: **openc3-app is not in the data path.** It only runs the
+Key design decision: **openc3-cosmos-app is not in the data path.** It only runs the
 control plane (spawn list, authorization, logs, file sync). The actual device
 bytes flow `host_interface_microservice → bridge_microservice → bridge_interface`
 directly over Iroh, paired inside the hub.
@@ -60,11 +60,11 @@ Everything is built on three Iroh primitives:
 |------|-----------|---------|
 | `stream/<name>` | COSMOS `bridge_interface` | Data path — COSMOS leg |
 | `host/<name>` | host `host_interface_microservice` | Data path — host leg |
-| `api/host_microservices` | openc3-app | Poll the list of host processes to spawn |
-| `api/authorize` | openc3-app | Publish the set of authorized host identities |
-| `api/files` | openc3-app | Hash-delta sync of the scope's plugin `lib/` files |
-| `api/log` | openc3-app | Forward host stdout up into COSMOS logging |
-| `api/enroll` | openc3-app | Redeem a one-time manual-enrollment code (remote pairing) |
+| `api/host_microservices` | openc3-cosmos-app | Poll the list of host processes to spawn |
+| `api/authorize` | openc3-cosmos-app | Publish the set of authorized host identities |
+| `api/files` | openc3-cosmos-app | Hash-delta sync of the scope's plugin `lib/` files |
+| `api/log` | openc3-cosmos-app | Forward host stdout up into COSMOS logging |
+| `api/enroll` | openc3-cosmos-app | Redeem a one-time manual-enrollment code (remote pairing) |
 
 The data path deliberately uses **two different ALPN prefixes** for the same
 `<name>`: `stream/<name>` (the trusted in-COSMOS leg) and `host/<name>` (the
@@ -86,9 +86,9 @@ How a peer actually reaches the hub depends on what addresses the ticket carries
   (`OPENC3_BRIDGE_PORT_BASE`, default 7799, one per bridge) that the operator
   container publishes on the host's loopback (see `compose.yaml`), and advertises
   `127.0.0.1:<port>` in its ticket (plus its `172.x` container address for
-  in-COSMOS peers). A **co-located** openc3-app dials `127.0.0.1:<port>` directly.
+  in-COSMOS peers). A **co-located** openc3-cosmos-app dials `127.0.0.1:<port>` directly.
   No relay, no exposed ports, works offline.
-- **Remote (opt-in).** A `127.0.0.1`/`172.x` ticket is useless to an openc3-app
+- **Remote (opt-in).** A `127.0.0.1`/`172.x` ticket is useless to an openc3-cosmos-app
   on another machine. To pair across the internet/NAT, set **`OPENC3_BRIDGE_RELAY`**
   to a relay URL. The hub then enables that relay, waits to come online, and
   advertises the relay URL (and its discovered public address) in the ticket, so
@@ -100,7 +100,7 @@ How a peer actually reaches the hub depends on what addresses the ticket carries
 - COSMOS side (the hub + any host interfaces): set it in the environment of the
   operator container, e.g. uncomment the line in `.env`. This affects
   `bridge_microservice` and `host_interface_microservice`.
-- openc3-app side (the host running the launcher): set it in openc3-app's own
+- openc3-cosmos-app side (the host running the launcher): set it in openc3-cosmos-app's own
   environment before launching.
 
 The value is a relay URL — an [n0 public relay][n0-relays] (e.g.
@@ -121,7 +121,7 @@ Stored in Redis/Valkey via COSMOS models, scoped per-scope:
 
 - **`BridgeModel`** (`name`, `public_key`, `ticket`, `app_public_key`,
   `enroll_code`) — one per named bridge. Holds the hub's stable **public** key,
-  its **current ticket** (refreshed each hub start), the enrolled **openc3-app
+  its **current ticket** (refreshed each hub start), the enrolled **openc3-cosmos-app
   public key** authorized for control APIs, and a pending one-time
   **enrollment code** for manual pairing.
 - **`BridgeInterfaceModel`** (`name`, `public_key`) — the public key of each
@@ -140,16 +140,16 @@ regenerates the ticket (address hints change), and rewrites `model.ticket`.
 
 ---
 
-## 4. Enrollment: how openc3-app gets trusted
+## 4. Enrollment: how openc3-cosmos-app gets trusted
 
-openc3-app authenticates to the hub with its **own persistent Iroh identity**
+openc3-cosmos-app authenticates to the hub with its **own persistent Iroh identity**
 (`<root>/bridge/identity.key`, 0600). Only its public key ever leaves the host.
 Enrollment yields the hub ticket, persisted in `<root>/bridge/current.json`.
 Two paths:
 
 ### Auto-enroll (co-located COSMOS, the default)
 
-The trust anchor is **local Docker access**. openc3-app runs the CLI inside the
+The trust anchor is **local Docker access**. openc3-cosmos-app runs the CLI inside the
 cmd-tlm-api container:
 
 ```
@@ -166,14 +166,14 @@ overrides it.
 ### Manual enroll (remote COSMOS)
 
 The COSMOS Admin → Bridges page (or `bridgetoken` CLI) generates a base64url
-token `{bridge, ticket, code}`. The user pastes it into openc3-app, which
+token `{bridge, ticket, code}`. The user pastes it into openc3-cosmos-app, which
 redeems the one-time `code` over the `api/enroll` ALPN using its own identity.
 On success the hub records that identity as `app_public_key` and clears the code
 (one-time). See `enroll.rs::enroll_with_token` and `bridge.rs::enroll`.
 
 Remote enrollment only works if the token's ticket is reachable from the
 enrolling host — i.e. the bridge must be running with `OPENC3_BRIDGE_RELAY` set
-(and the same relay set for openc3-app), otherwise the ticket only carries
+(and the same relay set for openc3-cosmos-app), otherwise the ticket only carries
 `127.0.0.1`/`172.x` addresses and the redeem times out. See
 [§2 Connectivity](#connectivity-local-vs-remote-the-relay). Generate the token
 *after* enabling the relay so it embeds the relay URL.
@@ -190,23 +190,23 @@ changes take effect without restarting the hub:
 
 1. **Control APIs (`api/*`, except `api/enroll`)** — the connection's Iroh
    `remote_id()` must equal `BridgeModel.app_public_key`. Only the enrolled
-   openc3-app may poll the spawn list, authorize hosts, sync files, or forward
+   openc3-cosmos-app may poll the spawn list, authorize hosts, sync files, or forward
    logs. (`bridge_microservice._authorized`)
 2. **COSMOS data leg (`stream/<name>`)** — `remote_id()` must equal
    `BridgeInterfaceModel(name).public_key`. Each `bridge_interface` registers
    its per-process public key at connect time.
    (`bridge_microservice._authorized_interface`)
 3. **Host data leg (`host/<name>`)** — `remote_id()` must be in the in-memory
-   `_authorized_hosts` set, which openc3-app publishes each cycle via
+   `_authorized_hosts` set, which openc3-cosmos-app publishes each cycle via
    `api/authorize`.
 
 ### Ephemeral host identities
 
-openc3-app **mints a fresh Iroh keypair per host microservice**
+openc3-cosmos-app **mints a fresh Iroh keypair per host microservice**
 (`generate_host_key`). The **secret** is handed to the child via
 `OPENC3_BRIDGE_PRIVATE_KEY` and **never persisted**; the **public** key is sent
 to the hub via `api/authorize` before the child connects. So only processes
-openc3-app actually spawned can use the data path, and nothing on the host holds
+openc3-cosmos-app actually spawned can use the data path, and nothing on the host holds
 a long-lived data-path secret.
 
 ---
@@ -220,7 +220,7 @@ a long-lived data-path secret.
    `write_interface` drain.
 2. `host_interface_microservice` builds the **real** interface
    (`config_params`/`options` forwarded from COSMOS), opens the device, binds
-   the openc3-app-provided identity, dials `host/<name>`, `accept_bi()`, strips
+   the openc3-cosmos-app-provided identity, dials `host/<name>`, `accept_bi()`, strips
    the primer, and pumps device bytes ↔ Iroh.
 3. The hub's `_rendezvous` pairs the two connections by `<name>`: the first
    arrival parks (up to `PAIR_TIMEOUT = 300s`); the second wires
@@ -257,9 +257,9 @@ handshake) rather than after the network hop.
 
 ---
 
-## 7. openc3-app: control-plane client & supervisor
+## 7. openc3-cosmos-app: control-plane client & supervisor
 
-openc3-app is a single cross-platform binary (Iced GUI + headless CLI). Its
+openc3-cosmos-app is a single cross-platform binary (Iced GUI + headless CLI). Its
 `MicroserviceOperator` runs a supervision loop that, each cycle:
 
 1. **`maybe_connect()`** — establishes/re-establishes the bridge connection.
@@ -289,7 +289,7 @@ Status** section.
 ### Log forwarding
 
 Each host process runs the real COSMOS `Logger` with `no_store=True`, printing a
-JSON log record per line to **stdout**. openc3-app captures stdout and streams
+JSON log record per line to **stdout**. openc3-cosmos-app captures stdout and streams
 it to the hub over `api/log`; `bridge_microservice._emit_host_log` writes each
 JSON record straight to the scope's `openc3_log_messages` topic, so host logs
 appear in COSMOS with their original level/microservice name.
@@ -298,7 +298,7 @@ appear in COSMOS with their original level/microservice name.
 
 ## 8. host_interface_microservice
 
-Launched by openc3-app as `python -u -m
+Launched by openc3-cosmos-app as `python -u -m
 openc3.microservices.host_interface_microservice` inside the per-service venv,
 with configuration passed via environment:
 
@@ -307,7 +307,7 @@ with configuration passed via environment:
 | `OPENC3_BRIDGE_TICKET` | Hub ticket to dial |
 | `OPENC3_BRIDGE_CHANNEL` | Stream/interface `<name>` (→ `host/<name>` ALPN) |
 | `OPENC3_HOST_INTERFACE` | JSON `{config_params, options, protocols}` for the real interface (`protocols` = host-side `BRIDGE_PROTOCOL`s) |
-| `OPENC3_BRIDGE_PRIVATE_KEY` | Ephemeral, openc3-app-minted identity (never persisted) |
+| `OPENC3_BRIDGE_PRIVATE_KEY` | Ephemeral, openc3-cosmos-app-minted identity (never persisted) |
 | `OPENC3_MICROSERVICE_NAME` | Name used for logging |
 | `PYTHONPATH` | Synced plugin `lib/` dirs |
 
@@ -350,7 +350,7 @@ pumps: device→bridge (`read_interface` → `send`) and bridge→device (`recv`
 ## 10. End-to-end sequence (first launch)
 
 ```
-openc3-app start
+openc3-cosmos-app start
   └─ load/create control identity  (<root>/bridge/identity.key)
   └─ auto-enroll: docker compose run … bridgeenroll DEFAULT <app_pubkey>
         └─ COSMOS: BridgeModel.app_public_key = <app_pubkey>; prints ticket

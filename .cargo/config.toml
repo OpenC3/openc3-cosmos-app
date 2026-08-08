@@ -4,6 +4,6 @@
 # Windows install fails with "VCRUNTIME140.dll was not found".
 #
 # Target-scoped, so macOS/Linux builds are unaffected. cargo reads this because
-# builds run from the openc3-app directory.
+# builds run from the openc3-cosmos-app directory.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

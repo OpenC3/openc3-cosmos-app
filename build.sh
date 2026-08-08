@@ -29,7 +29,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-IMAGE=openc3-app-builder
+IMAGE=openc3-cosmos-app-builder
 
 echo "Building Docker build environment image ($IMAGE)..."
 docker build -f docker/Dockerfile.build -t "$IMAGE" .
@@ -37,9 +37,9 @@ docker build -f docker/Dockerfile.build -t "$IMAGE" .
 RUN_ARGS=(--rm -v "$PWD":/work -w /work)
 
 # Cache cargo registry across runs.
-docker volume inspect openc3-app-cargo-registry >/dev/null 2>&1 \
-  || docker volume create openc3-app-cargo-registry >/dev/null
-RUN_ARGS+=(-v openc3-app-cargo-registry:/usr/local/cargo/registry)
+docker volume inspect openc3-cosmos-app-cargo-registry >/dev/null 2>&1 \
+  || docker volume create openc3-cosmos-app-cargo-registry >/dev/null
+RUN_ARGS+=(-v openc3-cosmos-app-cargo-registry:/usr/local/cargo/registry)
 
 # On macOS, default the SDK to the Command Line Tools SDK so the apple-darwin
 # targets build without requiring MACOS_SDK to be set manually.

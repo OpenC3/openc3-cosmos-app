@@ -1,5 +1,5 @@
 [package]
-name = "openc3-app"
+name = "openc3-cosmos-app"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"

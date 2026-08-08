@@ -91,7 +91,7 @@ impl Default for Settings {
 
 impl Settings {
     fn path(ctx: &Context) -> PathBuf {
-        ctx.paths.root.join("openc3-app-settings.json")
+        ctx.paths.root.join("openc3-cosmos-app-settings.json")
     }
 
     /// Load settings from disk, falling back to defaults on any error.
@@ -111,11 +111,11 @@ impl Settings {
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
-                    crate::logging::warn("openc3-app", &format!("could not save settings: {e}"));
+                    crate::logging::warn("openc3-cosmos-app", &format!("could not save settings: {e}"));
                 }
             }
             Err(e) => {
-                crate::logging::warn("openc3-app", &format!("could not serialize settings: {e}"));
+                crate::logging::warn("openc3-cosmos-app", &format!("could not serialize settings: {e}"));
             }
         }
     }

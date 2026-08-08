@@ -25,14 +25,14 @@ use std::time::Duration;
 
 use crate::process;
 
-/// `owner/repo` to query. Overridable via `OPENC3_APP_GITHUB_REPO` for forks or
+/// `owner/repo` to query. Overridable via `OPENC3_COSMOS_APP_GITHUB_REPO` for forks or
 /// testing. Release tags are `v<semver>`.
 const DEFAULT_REPO: &str = "OpenC3/openc3-cosmos-app";
 /// Re-check cadence after the initial startup check.
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
 fn repo() -> String {
-    std::env::var("OPENC3_APP_GITHUB_REPO")
+    std::env::var("OPENC3_COSMOS_APP_GITHUB_REPO")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_REPO.to_string())

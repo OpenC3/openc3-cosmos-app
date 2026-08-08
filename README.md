@@ -29,7 +29,7 @@ The app provides these functions (see `requirements.md`):
 ## Layout
 
 Everything an install needs lives in subfolders of a single application root
-(overridable with `--root` or `OPENC3_APP_HOME`):
+(overridable with `--root` or `OPENC3_COSMOS_APP_HOME`):
 
 ```
 <root>/
@@ -39,8 +39,8 @@ Everything an install needs lives in subfolders of a single application root
   bridge/                    control-plane identity (identity.key, current.json)
   host_files/                synced plugin code for host interfaces
   microservices/             per-host-interface working dirs + venvs
-  openc3-app-settings.json   persisted GUI settings
-  openc3-app.lock            single-instance guard
+  openc3-cosmos-app-settings.json   persisted GUI settings
+  openc3-cosmos-app.lock            single-instance guard
 ```
 
 The default root depends on how the app is run:
@@ -200,7 +200,7 @@ cargo build --no-default-features   # smaller headless-only binary
 
 ### Releasing
 
-Native installers are built by the `.github/workflows/openc3-app-release.yml`
+Native installers are built by the `.github/workflows/openc3-cosmos-app-release.yml`
 workflow. Running it via `workflow_dispatch` produces installers as artifacts;
 pushing a **`v<semver>`** tag (matching `version` in `Cargo.toml`) additionally
 attaches them to a GitHub Release. The app's self-update compares that tag
