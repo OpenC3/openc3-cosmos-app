@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# Copyright 2026 OpenC3, Inc.
+# All Rights Reserved.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE.md for more details.
+#
+# This file may also be used under the terms of a commercial license
+# if purchased from OpenC3, Inc.
+
 """Remove duplicate dylib load commands from a Mach-O binary (with ordinal fixup).
 
 Cross-linking the macOS targets with zig/LLD (via cargo-zigbuild) emits a

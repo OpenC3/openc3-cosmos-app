@@ -1,3 +1,14 @@
+// Copyright 2026 OpenC3, Inc.
+// All Rights Reserved.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See LICENSE.md for more details.
+//
+// This file may also be used under the terms of a commercial license
+// if purchased from OpenC3, Inc.
+
 //! Minimal `.env` file parsing. COSMOS ships a `.env` next to its
 //! `compose.yaml`; `docker compose` reads it automatically, but a few
 //! commands (cli/cliroot/util) need individual values to forward to the
