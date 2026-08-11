@@ -262,7 +262,11 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     if let Some(uv) = locate_uv(python_dir) {
         let mut create = Command::new(&uv);
         create
-            .args(["venv", "--python", DEFAULT_PYTHON])
+            // --clear replaces any existing (possibly partial or unrecognized)
+            // venv without uv's interactive "already exists, replace? [y/n]"
+            // prompt, which hangs the app when stdin is a TTY. Reaching here
+            // means we intend a fresh venv anyway.
+            .args(["venv", "--clear", "--python", DEFAULT_PYTHON])
             .arg(venv_dir)
             .env("UV_PYTHON_INSTALL_DIR", &runtimes)
             .env("UV_CACHE_DIR", &cache);

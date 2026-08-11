@@ -64,8 +64,14 @@ pub struct Settings {
     /// Development mode: force OPENC3_TAG / OPENC3_ENTERPRISE_TAG to "latest"
     /// and drive COSMOS from a local source checkout's `openc3.sh`.
     pub dev_mode: bool,
-    /// The local source checkout used in development mode (contains `openc3.sh`).
+    /// The local **core** source checkout used in development mode. Always the
+    /// source of the openc3 Python library (`OPENC3_DEVEL`). For Core edition it
+    /// also provides the `openc3.sh` COSMOS is run from.
     pub dev_folder: String,
+    /// The local **enterprise** source checkout, used in development mode only
+    /// when the edition is Enterprise. It provides the `openc3.sh`/compose COSMOS
+    /// is run from; the Python library still comes from `dev_folder` (core).
+    pub dev_folder_enterprise: String,
     /// A release version the user chose to skip; the update prompt won't reappear
     /// for it (a newer version still prompts). Empty = nothing skipped.
     pub skipped_version: String,
@@ -83,6 +89,7 @@ impl Default for Settings {
             enterprise_token: String::new(),
             dev_mode: false,
             dev_folder: String::new(),
+            dev_folder_enterprise: String::new(),
             skipped_version: String::new(),
             cosmos_skipped_version: String::new(),
         }

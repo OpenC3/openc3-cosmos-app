@@ -240,6 +240,13 @@ actually open, and the host never opens a device COSMOS isn't listening for:
   device drops the COSMOS interface. After a host-side error the host does **not**
   auto-reconnect — it waits for COSMOS to reconnect the `bridge_interface` and
   drive a fresh READY/GO cycle.
+- **Host self-disconnect is reported over the control channel.** The host pushes
+  its interface state (CONNECTED/DISCONNECTED) up the `hostctrl/<name>` channel
+  every second. When the host drops its device on its own — after having reported
+  CONNECTED — `bridge_interface` makes `read_interface` return `nil`, so COSMOS's
+  `InterfaceMicroservice` disconnects and reconnects (re-commanding the host).
+  This is independent of the data-tunnel EOF, so a host drop still surfaces even
+  if the data leg's close doesn't cleanly reach the COSMOS side.
 
 ### Protocols: COSMOS-side vs host-side
 

@@ -256,11 +256,12 @@ struct State {
     settings_open: bool,
     /// Persisted settings (COSMOS URL, run-locally toggle).
     settings: crate::settings::Settings,
-    /// The effective Development-mode context (dev folder, or None) captured when
-    /// the Settings page was opened. On close we compare against the current
-    /// context; if it changed we restart the operator so the bridge re-enrolls
-    /// against the new compose context.
-    dev_context_on_open: Option<std::path::PathBuf>,
+    /// The effective Development-mode context — `(run folder, core folder)` —
+    /// captured when the Settings page was opened. On close we compare against the
+    /// current context; if either changed we restart the operator so the bridge
+    /// re-enrolls against the new compose context and host venvs pick up the new
+    /// OPENC3_DEVEL (core) source.
+    dev_context_on_open: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
     /// Whether the "Shutdown COSMOS?" confirmation modal is showing.
     shutdown_confirm: bool,
     /// Whether the "Quit OpenC3 COSMOS?" confirmation modal is showing. Only used
@@ -384,6 +385,11 @@ enum Message {
     DevFolderChanged(String),
     BrowseDevFolder,
     DevFolderPicked(Option<std::path::PathBuf>),
+    /// The enterprise dev checkout (Enterprise edition only; core stays in
+    /// `DevFolder*`, which supplies the Python library).
+    DevFolderEnterpriseChanged(String),
+    BrowseDevFolderEnterprise,
+    DevFolderEnterprisePicked(Option<std::path::PathBuf>),
     LogLevelChanged(LogLevelFilter),
     LogSearchChanged(String),
     ToggleLogPause,
@@ -417,9 +423,10 @@ impl State {
         let settings = crate::settings::Settings::load(&ctx);
         // The persisted edition is the source of truth in the GUI.
         ctx.enterprise = settings.edition.is_enterprise();
-        // Development mode: source folder first, then env overrides derived from it.
-        ctx.dev_folder = dev_folder_from_settings(&settings);
-        apply_dev_env(settings.dev_mode, ctx.dev_folder.as_deref());
+        // Development mode: the run folder (openc3.sh/compose) drives the context;
+        // OPENC3_DEVEL (the openc3 Python library) always comes from the core folder.
+        ctx.dev_folder = dev_run_folder(&settings);
+        apply_dev_env(settings.dev_mode, dev_core_folder(&settings).as_deref());
         let env = EnvCheck {
             container_ok: ctx.runtime.is_some(),
             container_installed: crate::context::container_engine_installed(),
@@ -489,7 +496,7 @@ impl State {
             settings_open: false,
             settings,
             // Set when the Settings page opens; only compared on close.
-            dev_context_on_open: None,
+            dev_context_on_open: (None, None),
             shutdown_confirm: false,
             quit_confirm: false,
             restart_pending: false,
@@ -547,8 +554,8 @@ impl State {
     /// Re-apply development-mode settings: the process-env tag overrides and the
     /// context's dev source folder.
     fn apply_dev_settings(&mut self) {
-        self.ctx.dev_folder = dev_folder_from_settings(&self.settings);
-        apply_dev_env(self.settings.dev_mode, self.ctx.dev_folder.as_deref());
+        self.ctx.dev_folder = dev_run_folder(&self.settings);
+        apply_dev_env(self.settings.dev_mode, dev_core_folder(&self.settings).as_deref());
         // Keep the COSMOS checker's live dev-mode flag in sync (it skips dev
         // mode, which runs "latest" from source rather than a tagged install).
         self.cosmos_dev_mode
@@ -983,6 +990,9 @@ impl State {
                 // The rest of the app (compose profiles, upgrade source) keys off
                 // ctx.enterprise, so keep it in sync with the chosen edition.
                 self.ctx.enterprise = edition.is_enterprise();
+                // The dev run folder depends on the edition (Enterprise runs from
+                // the enterprise checkout), so re-derive the dev context.
+                self.apply_dev_settings();
                 self.settings.save(&self.ctx);
                 Task::none()
             }
@@ -1037,26 +1047,54 @@ impl State {
                 }
                 Task::none()
             }
+            Message::DevFolderEnterpriseChanged(value) => {
+                // Persisted on close (see CloseSettings).
+                self.settings.dev_folder_enterprise = value;
+                self.apply_dev_settings();
+                Task::none()
+            }
+            Message::BrowseDevFolderEnterprise => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Choose the COSMOS Enterprise development folder")
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::DevFolderEnterprisePicked,
+            ),
+            Message::DevFolderEnterprisePicked(picked) => {
+                if let Some(path) = picked {
+                    self.settings.dev_folder_enterprise = path.to_string_lossy().into_owned();
+                    self.apply_dev_settings();
+                    self.settings.save(&self.ctx);
+                }
+                Task::none()
+            }
             Message::ShowSettings => {
                 self.settings_open = true;
-                // Remember the effective dev context so we can tell on close
-                // whether it changed (and thus whether to re-enroll the bridge).
-                self.dev_context_on_open = self.ctx.dev_folder.clone();
+                // Remember the effective dev context (run folder + core folder) so
+                // we can tell on close whether it changed (and thus whether to
+                // re-enroll the bridge / rebuild host venvs).
+                self.dev_context_on_open =
+                    (self.ctx.dev_folder.clone(), dev_core_folder(&self.settings));
                 Task::none()
             }
             Message::CloseSettings => {
                 self.settings_open = false;
                 // Persist any text-field edits made while the dialog was open.
                 self.settings.save(&self.ctx);
-                // If Development Mode was switched on/off (or the dev folder
-                // changed), the bridge's compose context changed — restart the
-                // operator so enrollment re-runs against the new context.
-                if self.ctx.dev_folder != self.dev_context_on_open {
+                // If Development Mode was switched on/off, or either the run folder
+                // (compose context) or the core folder (OPENC3_DEVEL) changed,
+                // restart the operator so enrollment re-runs against the new
+                // context and host venvs pick up the new source.
+                let dev_context = (self.ctx.dev_folder.clone(), dev_core_folder(&self.settings));
+                if dev_context != self.dev_context_on_open {
                     crate::logging::info(
                         "bridge",
                         "Development context changed; re-running bridge enrollment",
                     );
-                    self.dev_context_on_open = self.ctx.dev_folder.clone();
+                    self.dev_context_on_open = dev_context;
                     self.restart_operator(true);
                 }
                 Task::none()
@@ -2786,15 +2824,20 @@ impl State {
         ]
         .spacing(6);
         if self.settings.dev_mode {
+            let enterprise = self.settings.edition.is_enterprise();
+            // Core checkout: always the source of the openc3 Python library. For
+            // Core edition it's also what COSMOS is run from.
+            let core_label = if enterprise {
+                "Core development folder (openc3 Python library)"
+            } else {
+                "Development folder (contains openc3.sh)"
+            };
             dev_section = dev_section.push(
                 row![
-                    text_input(
-                        "Development folder (contains openc3.sh)",
-                        &self.settings.dev_folder
-                    )
-                    .on_input(Message::DevFolderChanged)
-                    .padding(8)
-                    .width(Length::Fill),
+                    text_input(core_label, &self.settings.dev_folder)
+                        .on_input(Message::DevFolderChanged)
+                        .padding(8)
+                        .width(Length::Fill),
                     button(text("Browse…"))
                         .padding(8)
                         .on_press(Message::BrowseDevFolder),
@@ -2802,6 +2845,26 @@ impl State {
                 .spacing(8)
                 .align_y(Center),
             );
+            if enterprise {
+                // Enterprise checkout: the openc3.sh/compose COSMOS is run from.
+                // (The Python library still comes from the core folder above.)
+                dev_section = dev_section.push(
+                    row![
+                        text_input(
+                            "Enterprise development folder (contains openc3.sh)",
+                            &self.settings.dev_folder_enterprise
+                        )
+                        .on_input(Message::DevFolderEnterpriseChanged)
+                        .padding(8)
+                        .width(Length::Fill),
+                        button(text("Browse…"))
+                            .padding(8)
+                            .on_press(Message::BrowseDevFolderEnterprise),
+                    ]
+                    .spacing(8)
+                    .align_y(Center),
+                );
+            }
         }
 
         let cosmos_version_line = match crate::update::installed_cosmos_version(&self.ctx.paths.env_file())
@@ -3026,9 +3089,10 @@ impl State {
 /// Apply the development-mode process-environment overrides so child processes
 /// (docker compose / openc3.sh) and host-microservice venvs pick them up:
 ///   * OPENC3_TAG / OPENC3_ENTERPRISE_TAG = "latest" (override the `.env`), and
-///   * OPENC3_DEVEL = the local openc3 gem in the dev folder, so host venvs
-///     install openc3 editable from the working-tree source (see
-///     `operator::openc3_devel_source`) instead of the published package.
+///   * OPENC3_DEVEL = the local openc3 gem in the **core** dev folder, so host
+///     venvs install openc3 editable from the working-tree source (see
+///     `operator::openc3_devel_source`) instead of the published package. The
+///     Python library always comes from core, even for an Enterprise dev run.
 fn apply_dev_env(dev_mode: bool, dev_folder: Option<&std::path::Path>) {
     if dev_mode {
         std::env::set_var("OPENC3_TAG", "latest");
@@ -3058,14 +3122,32 @@ fn openc3_gem_dir(dev: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// The development source folder to drive COSMOS from, when dev mode is on and a
-/// (non-empty) folder is configured.
-fn dev_folder_from_settings(settings: &crate::settings::Settings) -> Option<std::path::PathBuf> {
+/// The **core** development checkout (`settings.dev_folder`) — the source of the
+/// openc3 Python library (`OPENC3_DEVEL`). None when dev mode is off or unset.
+fn dev_core_folder(settings: &crate::settings::Settings) -> Option<std::path::PathBuf> {
     if settings.dev_mode && !settings.dev_folder.trim().is_empty() {
         Some(std::path::PathBuf::from(settings.dev_folder.trim()))
     } else {
         None
     }
+}
+
+/// The development checkout COSMOS is actually run from (its `openc3.sh` /
+/// compose). For Enterprise that's the enterprise checkout
+/// (`settings.dev_folder_enterprise`); for Core it's the core checkout
+/// (`settings.dev_folder`). None when dev mode is off or the relevant folder is
+/// unset. The Python library always comes from the core folder regardless (see
+/// `dev_core_folder`).
+fn dev_run_folder(settings: &crate::settings::Settings) -> Option<std::path::PathBuf> {
+    if !settings.dev_mode {
+        return None;
+    }
+    let folder = if settings.edition.is_enterprise() {
+        settings.dev_folder_enterprise.trim()
+    } else {
+        settings.dev_folder.trim()
+    };
+    (!folder.is_empty()).then(|| std::path::PathBuf::from(folder))
 }
 
 /// Probe the COSMOS web UI: ready when `url` returns success and serves the
