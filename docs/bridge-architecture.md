@@ -12,18 +12,18 @@ processes, authorizing identities, forwarding logs, and shipping plugin code.
 ## 1. The four components
 
 ```
-   ┌─────────────────────── COSMOS (Docker) ───────────────────────┐        ┌──────────── Host machine ────────────┐
-   │                                                                │        │                                       │
-   │   bridge_interface ──stream/<name>──┐                          │        │   openc3-cosmos-app (Rust launcher)          │
-   │   (a normal COSMOS Interface)       │                          │        │     • control-plane client of the hub │
-   │                                     ▼                          │        │     • spawns + supervises host procs  │
-   │                          bridge_microservice  ◀───api/*────────┼────────┼──▶  │                                  │
-   │                          (the Iroh "hub")                      │        │     └─ host_interface_microservice    │
-   │                                     ▲                          │        │          (Python, one per interface)  │
-   │                                     └──host/<name>─────────────┼────────┼──────┘         │                       │
-   │                                                                │        │                ▼                      │
-   └────────────────────────────────────────────────────────────────┘      │          real device (serial/USB/...) │
-                                                                            └───────────────────────────────────────┘
+   ┌────────────────────── COSMOS (Docker) ─────────────────────┐    ┌──────────── Host machine ───────────-─┐
+   │                                                            │    │                                       │
+   │   bridge_interface ──stream/<name>──┐                      │    │   openc3-cosmos-app (Rust launcher)   │
+   │   (COSMOS Interface)                │                      │    │     • control-plane client of the hub │
+   │                                     ▼                      │    │     • spawns + supervises host procs  │
+   │                      bridge_microservice  ◀───api/*────────┼────┼──▶  │                                 │
+   │                      (the Iroh "hub")                      │    │     └─ host_interface_microservice    │
+   │                                     ▲                      │    │          (Python, one per interface)  │
+   │                                     └──host/<name>─────────┼────┼──────┘         │                      │
+   │                                                            │    │                ▼                      │
+   └────────────────────────────────────────────────────────────┘    │          real device (serial/USB/...) │
+                                                                     └───────────────────────────────────────┘
 ```
 
 | Component | Where | Language | Role |
