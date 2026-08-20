@@ -78,6 +78,11 @@ pub struct Settings {
     /// A COSMOS version the user chose to skip (same semantics as
     /// `skipped_version`, but for the COSMOS-itself update prompt).
     pub cosmos_skipped_version: String,
+    /// Explicit bridge preference. When absent (including settings files from
+    /// older app versions), bridge support follows the installed COSMOS
+    /// version: enabled for 7.4.0+, disabled for older/unknown versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_bridge: Option<bool>,
 }
 
 impl Default for Settings {
@@ -92,6 +97,7 @@ impl Default for Settings {
             dev_folder_enterprise: String::new(),
             skipped_version: String::new(),
             cosmos_skipped_version: String::new(),
+            disable_bridge: None,
         }
     }
 }
@@ -136,5 +142,46 @@ impl Settings {
         } else {
             trimmed
         }
+    }
+
+    /// Whether bridge functionality should run. An explicit setting wins;
+    /// otherwise it is enabled only for COSMOS 7.4.0 or newer. Development mode
+    /// represents the current source tree (`latest`), so it supports the bridge.
+    pub fn bridge_enabled(&self, cosmos_env: &std::path::Path) -> bool {
+        if let Some(disabled) = self.disable_bridge {
+            return !disabled;
+        }
+        if self.dev_mode {
+            return true;
+        }
+        crate::update::installed_cosmos_version(cosmos_env)
+            .is_some_and(|version| crate::update::is_at_least(&version, "7.4.0"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_bridge_preference_wins_without_an_installed_version() {
+        let missing_env = std::path::Path::new("this-file-does-not-exist");
+        let mut settings = Settings::default();
+        assert!(!settings.bridge_enabled(missing_env));
+
+        settings.disable_bridge = Some(false);
+        assert!(settings.bridge_enabled(missing_env));
+
+        settings.disable_bridge = Some(true);
+        assert!(!settings.bridge_enabled(missing_env));
+    }
+
+    #[test]
+    fn development_mode_enables_bridge_by_default() {
+        let settings = Settings {
+            dev_mode: true,
+            ..Settings::default()
+        };
+        assert!(settings.bridge_enabled(std::path::Path::new("this-file-does-not-exist")));
     }
 }

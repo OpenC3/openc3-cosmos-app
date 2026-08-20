@@ -135,6 +135,11 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     triple(latest) > triple(current)
 }
 
+/// True when `version` is at least `minimum`, comparing the numeric X.Y.Z core.
+pub fn is_at_least(version: &str, minimum: &str) -> bool {
+    triple(version) >= triple(minimum)
+}
+
 fn triple(v: &str) -> (u64, u64, u64) {
     let core = v.split(['-', '+']).next().unwrap_or(v);
     let mut it = core.split('.').map(|p| p.trim().parse::<u64>().unwrap_or(0));
@@ -391,6 +396,10 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.2.0"));
         // Prerelease/build suffixes are ignored (we compare the X.Y.Z core).
         assert!(is_newer("0.2.0-rc1", "0.1.0"));
+        assert!(!is_at_least("7.3.9", "7.4.0"));
+        assert!(is_at_least("7.4.0", "7.4.0"));
+        assert!(is_at_least("7.4.1", "7.4.0"));
+        assert!(is_at_least("8.0.0", "7.4.0"));
     }
 
     #[test]

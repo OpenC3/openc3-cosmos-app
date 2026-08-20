@@ -105,8 +105,9 @@ Launched by default (or with `openc3 gui`), the Iced control panel provides:
 - **Bridge status** — whether the host-interface bridge is paired and connected,
   with per-interface connection state and rx/tx byte counts.
 - **Settings** — COSMOS URL, Core vs Enterprise edition (+ enterprise token),
-  run-locally toggle, and **Development Mode** (drive COSMOS from a local source
-  checkout at `latest`).
+  run-locally and bridge toggles, and **Development Mode** (drive COSMOS from a
+  local source checkout at `latest`). The bridge defaults off before COSMOS
+  7.4.0 and on for COSMOS 7.4.0 or newer.
 - **Self-update** — background checks (startup + every 8h) for a newer app
   release and a newer COSMOS version, each surfaced as an install prompt; a
   **Check for updates now** button covers both.

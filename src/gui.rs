@@ -209,6 +209,10 @@ struct State {
     operator_status: Arc<Mutex<Vec<MicroserviceStatus>>>,
     operator_shutdown: Arc<AtomicBool>,
     operator_thread: Option<JoinHandle<()>>,
+    /// Whether the currently running (or stopped) operator handles represent an
+    /// enabled bridge. Used to react when a COSMOS install/upgrade crosses the
+    /// version-based default boundary.
+    bridge_operator_enabled: bool,
     microservices: Vec<MicroserviceStatus>,
     /// Shared + display copy of the COSMOS bridge connection health.
     bridge_status_handle: Arc<Mutex<BridgeConnectionStatus>>,
@@ -308,9 +312,18 @@ type OperatorHandles = (
     Option<JoinHandle<()>>,
 );
 
-fn start_operator(ctx: &Context, retry: Arc<AtomicBool>) -> OperatorHandles {
+fn start_operator(ctx: &Context, retry: Arc<AtomicBool>, bridge_enabled: bool) -> OperatorHandles {
     let mut operator =
         MicroserviceOperator::new(ctx.paths.python.clone(), ctx.paths.microservices.clone());
+    let status = operator.status_handle();
+    let bridge_status = operator.bridge_status_handle();
+    let shutdown = operator.shutdown_handle();
+    if !bridge_enabled {
+        if let Ok(mut value) = bridge_status.lock() {
+            value.message = "Bridge functionality disabled".to_string();
+        }
+        return (status, bridge_status, shutdown, None);
+    }
     // Auto-enroll runs in the operator loop once COSMOS has been up a while
     // (retried, bounded, re-armed on restart). Give it a connector + a cheap
     // COSMOS-up check, both capturing the context.
@@ -324,9 +337,6 @@ fn start_operator(ctx: &Context, retry: Arc<AtomicBool>) -> OperatorHandles {
         Box::new(move || crate::monitor::cosmos_readiness(&ready_ctx, false)),
     );
     operator.set_retry_flag(retry);
-    let status = operator.status_handle();
-    let bridge_status = operator.bridge_status_handle();
-    let shutdown = operator.shutdown_handle();
     let thread = Some(std::thread::spawn(move || operator.run()));
     (status, bridge_status, shutdown, thread)
 }
@@ -379,6 +389,7 @@ enum Message {
     CloseSettings,
     CosmosUrlChanged(String),
     RunLocallyToggled(bool),
+    BridgeDisabledToggled(bool),
     EditionChanged(crate::settings::Edition),
     EnterpriseTokenChanged(String),
     DevModeToggled(bool),
@@ -439,8 +450,9 @@ impl State {
         // Start the host microservice operator (process spawner/monitor) on a
         // background thread and keep a handle to its published status.
         let bridge_retry = Arc::new(AtomicBool::new(false));
+        let bridge_enabled = settings.bridge_enabled(&ctx.paths.env_file());
         let (operator_status, bridge_status_handle, operator_shutdown, operator_thread) =
-            start_operator(&ctx, bridge_retry.clone());
+            start_operator(&ctx, bridge_retry.clone(), bridge_enabled);
 
         crate::logging::info("openc3-cosmos-app", "OpenC3 COSMOS control panel ready.");
 
@@ -473,6 +485,7 @@ impl State {
             operator_status,
             operator_shutdown,
             operator_thread,
+            bridge_operator_enabled: bridge_enabled,
             bridge_status_handle,
             bridge_status: BridgeConnectionStatus::default(),
             microservices: Vec::new(),
@@ -571,6 +584,8 @@ impl State {
     /// UI never blocks and the operator's bridge closures capture the updated `ctx`.
     fn restart_operator(&mut self, reenroll: bool) {
         let ctx = self.ctx.clone();
+        let bridge_enabled = self.settings.bridge_enabled(&ctx.paths.env_file());
+        self.bridge_operator_enabled = bridge_enabled;
         let shutdown = self.operator_shutdown.clone();
         let old_thread = self.operator_thread.take();
         let retry = self.bridge_retry.clone();
@@ -585,7 +600,7 @@ impl State {
             if let Some(handle) = old_thread {
                 let _ = handle.join();
             }
-            let handles = start_operator(&ctx, retry);
+            let handles = start_operator(&ctx, retry, bridge_enabled);
             if let Ok(mut slot) = next_operator.lock() {
                 *slot = Some(handles);
             }
@@ -732,6 +747,16 @@ impl State {
         match message {
             Message::Tick => {
                 self.drain_shared();
+                // A COSMOS install or upgrade can change the version-derived
+                // default while the app is open. Start/stop the bridge once the
+                // background task has finished, unless Settings is being edited.
+                let bridge_enabled = self.settings.bridge_enabled(&self.ctx.paths.env_file());
+                if !self.busy
+                    && !self.settings_open
+                    && bridge_enabled != self.bridge_operator_enabled
+                {
+                    self.restart_operator(false);
+                }
                 if let Ok(list) = self.operator_status.lock() {
                     self.microservices = list.clone();
                 }
@@ -985,6 +1010,20 @@ impl State {
                 self.settings.save(&self.ctx);
                 Task::none()
             }
+            Message::BridgeDisabledToggled(disabled) => {
+                self.settings.disable_bridge = Some(disabled);
+                self.settings.save(&self.ctx);
+                crate::logging::info(
+                    "bridge",
+                    if disabled {
+                        "Bridge functionality disabled"
+                    } else {
+                        "Bridge functionality enabled"
+                    },
+                );
+                self.restart_operator(false);
+                Task::none()
+            }
             Message::EditionChanged(edition) => {
                 self.settings.edition = edition;
                 // The rest of the app (compose profiles, upgrade source) keys off
@@ -1199,7 +1238,9 @@ impl State {
                             if let Some(handle) = old_thread {
                                 let _ = handle.join();
                             }
-                            start_operator(&ctx, retry)
+                            let bridge_enabled = crate::settings::Settings::load(&ctx)
+                                .bridge_enabled(&ctx.paths.env_file());
+                            start_operator(&ctx, retry, bridge_enabled)
                         }
                         Err(e) => {
                             crate::logging::error("bridge", &format!("Enrollment failed: {e:#}"));
@@ -2512,7 +2553,9 @@ impl State {
         .align_y(Center);
         // Offer a manual retry whenever the bridge isn't connected (auto-enroll
         // gives up after a few tries per COSMOS up-session).
-        if !self.bridge_status.connected {
+        if self.settings.bridge_enabled(&self.ctx.paths.env_file())
+            && !self.bridge_status.connected
+        {
             cosmos_row = cosmos_row.push(
                 button(text("Retry").size(12))
                     .padding(4)
@@ -2762,25 +2805,36 @@ impl State {
 
         // Bridge pairing: redeem an enrollment token from a remote COSMOS's
         // Admin → Bridges page. Co-located COSMOS enrolls automatically.
-        let pair_section = column![
+        let bridge_enabled = self.settings.bridge_enabled(&self.ctx.paths.env_file());
+        let mut pair_section = column![
             text("Bridge Pairing").size(16),
+            checkbox("Disable bridge functionality", !bridge_enabled)
+                .on_toggle(Message::BridgeDisabledToggled),
             text(
+                "By default, bridge functionality is disabled before COSMOS 7.4.0 and enabled for 7.4.0 or newer."
+            )
+            .size(12)
+            .color(grey),
+        ]
+        .spacing(6);
+        if bridge_enabled {
+            pair_section = pair_section.push(text(
                 "Paste an enrollment token from a remote COSMOS (Admin → Bridges) to \
                  pair with its bridge. A co-located COSMOS pairs automatically."
             )
             .size(13)
-            .color(grey),
+            .color(grey));
             // Multi-line editor so the long token wraps inside the box instead
             // of overflowing the dialog.
-            text_editor(&self.bridge_token_content)
+            pair_section = pair_section.push(text_editor(&self.bridge_token_content)
                 .placeholder("Enrollment token")
                 .on_action(Message::BridgeTokenAction)
                 .font(Font::MONOSPACE)
                 // The token is one long space-less string; break on glyphs so it
                 // wraps inside the box instead of overflowing.
                 .wrapping(text::Wrapping::WordOrGlyph)
-                .height(90),
-            row![
+                .height(90));
+            pair_section = pair_section.push(row![
                 Space::with_width(Length::Fill),
                 {
                     let pairing = self.bridge_pairing.load(Ordering::Relaxed);
@@ -2789,9 +2843,8 @@ impl State {
                         .on_press_maybe((!pairing).then_some(Message::SubmitBridgeToken))
                 },
             ]
-            .align_y(Center),
-        ]
-        .spacing(6);
+            .align_y(Center));
+        }
 
         // Destructive cleanup: opens the typed-confirmation page.
         let cleanup_section = column![
