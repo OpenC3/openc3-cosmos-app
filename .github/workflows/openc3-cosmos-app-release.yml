@@ -188,7 +188,7 @@ jobs:
         run: cargo install cargo-packager --locked
 
       - name: Build the release binary
-        run: cargo build --release --target ${{ matrix.rust_target }}
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
 
       # cargo-packager takes the codesign identity from the `signing-identity`
       # config field, not an env var. Cargo.toml defaults it to ad-hoc ("-");
