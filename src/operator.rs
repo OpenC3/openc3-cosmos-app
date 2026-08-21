@@ -783,18 +783,25 @@ impl MicroserviceOperator {
     /// with bounded attempts per up-session (re-armed on restart). Called once
     /// per operator cycle; throttled to [`BRIDGE_CHECK_INTERVAL`].
     fn maybe_connect(&mut self) {
-        if self.bridge_client.is_some()
-            || self.bridge_connector.is_none()
-            || self.cosmos_uptime.is_none()
-        {
+        if self.bridge_connector.is_none() || self.cosmos_uptime.is_none() {
             return;
         }
-        // A manual retry re-arms enrollment immediately — reset the attempt
-        // counter and clear any wait so we try again this cycle.
+        // A manual retry re-arms enrollment immediately. Even a configured
+        // client is discarded: its construction does not complete an Iroh
+        // handshake, so a stale peer certificate may only have surfaced in the
+        // later API poll. The connector first validates the existing cached
+        // ticket and replaces an auto-enrollment only for that certificate
+        // failure.
         if self.retry.swap(false, Ordering::Relaxed) {
+            self.bridge_client = None;
+            self.bridge_ticket = None;
+            self.log_tx = None;
             self.enroll_attempts = 0;
             self.next_bridge_check = Instant::now();
             self.unpaired_reason = Some("retrying…".to_string());
+        }
+        if self.bridge_client.is_some() {
+            return;
         }
         let now = Instant::now();
         if now < self.next_bridge_check {

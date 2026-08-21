@@ -50,6 +50,20 @@ struct Current {
     manual: bool,
 }
 
+/// Where the ticket used for a connection attempt came from. Only an
+/// auto-enrolled cached ticket is safe to replace without user input.
+enum TicketSource {
+    Environment,
+    CachedAuto { bridge: String },
+    CachedManual,
+    AutoEnrolled,
+}
+
+struct ResolvedTicket {
+    ticket: String,
+    source: TicketSource,
+}
+
 /// A manual enrollment token's decoded payload (base64url JSON), produced by the
 /// COSMOS Admin Bridges page / `bridgetoken` CLI.
 #[derive(Debug, Deserialize)]
@@ -180,14 +194,27 @@ fn write_current(root: &Path, bridge: &str, ticket: &str, manual: bool) -> Resul
 /// over the local Docker control plane. The bridge defaults to `DEFAULT` (every
 /// scope has a DEFAULT bridge); `OPENC3_BRIDGE_NAME` overrides it. On failure
 /// returns a short human reason (shown in the GUI) explaining why it isn't paired.
-fn resolve_ticket(ctx: &Context, app_public_key_hex: &str) -> Result<String, String> {
+fn resolve_ticket(ctx: &Context, app_public_key_hex: &str) -> Result<ResolvedTicket, String> {
     if let Ok(ticket) = std::env::var("OPENC3_BRIDGE_TICKET") {
         if !ticket.is_empty() {
-            return Ok(ticket);
+            return Ok(ResolvedTicket {
+                ticket,
+                source: TicketSource::Environment,
+            });
         }
     }
     if let Some(current) = read_current(&ctx.paths.root) {
-        return Ok(current.ticket);
+        let source = if current.manual {
+            TicketSource::CachedManual
+        } else {
+            TicketSource::CachedAuto {
+                bridge: current.bridge,
+            }
+        };
+        return Ok(ResolvedTicket {
+            ticket: current.ticket,
+            source,
+        });
     }
     // Auto-enroll on first launch with the scope's DEFAULT bridge (co-located
     // COSMOS via local Docker). A remote/unmanaged COSMOS instead pairs with a
@@ -205,7 +232,10 @@ fn resolve_ticket(ctx: &Context, app_public_key_hex: &str) -> Result<String, Str
     })?;
     let _ = write_current(&ctx.paths.root, &name, &ticket, false); // auto
     crate::logging::info("bridge", &format!("auto-enrolled with '{name}'"));
-    Ok(ticket)
+    Ok(ResolvedTicket {
+        ticket,
+        source: TicketSource::AutoEnrolled,
+    })
 }
 
 /// Register openc3-cosmos-app's public key with COSMOS and read back the hub ticket by
@@ -265,18 +295,92 @@ pub fn connect_bridge(ctx: &Context) -> Result<(String, BridgeClient), String> {
         crate::logging::warn("bridge", &format!("could not load control identity: {e:#}"));
         "identity error".to_string()
     })?;
-    let ticket = resolve_ticket(ctx, &public_key_hex(&secret))?;
-    BridgeClient::connect(secret, &ticket)
-        .map(|client| (ticket, client))
-        .map_err(|e| {
-            crate::logging::warn(
-                "bridge",
-                &format!("failed to connect to bridge_microservice: {e:#}"),
-            );
-            format!(
-                "can't reach the bridge hub — it may still be starting, or its ticket is \
-                 stale after a COSMOS restart; press Retry ({})",
-                brief(&e)
-            )
-        })
+    let public_key = public_key_hex(&secret);
+    let resolved = resolve_ticket(ctx, &public_key)?;
+    match connect_and_validate(secret.clone(), &resolved.ticket) {
+        Ok(client) => Ok((resolved.ticket, client)),
+        Err(first_error) => {
+            // A cached auto-enrollment can outlive the hub identity embedded in
+            // its ticket (for example after switching compose contexts or
+            // recreating COSMOS data). First try it as-is; only an Iroh peer
+            // certificate mismatch triggers replacement. Manual tickets and an
+            // explicit environment override remain user-owned and untouched.
+            if peer_certificate_error(&first_error) {
+                if let TicketSource::CachedAuto { bridge } = resolved.source {
+                    crate::logging::warn(
+                        "bridge",
+                        "cached bridge ticket has a stale peer certificate; re-enrolling",
+                    );
+                    forget_cached_ticket(&ctx.paths.root);
+                    let fresh = auto_enroll(ctx, &bridge, &public_key).map_err(|e| {
+                        crate::logging::warn(
+                            "bridge",
+                            &format!("re-enrollment with '{bridge}' failed: {e:#}"),
+                        );
+                        format!("re-enrolling bridge '{bridge}' failed: {}", brief(&e))
+                    })?;
+                    write_current(&ctx.paths.root, &bridge, &fresh, false).map_err(|e| {
+                        crate::logging::warn(
+                            "bridge",
+                            &format!("could not cache refreshed bridge ticket: {e:#}"),
+                        );
+                        format!("could not save refreshed bridge enrollment: {}", brief(&e))
+                    })?;
+                    return connect_and_validate(secret, &fresh)
+                        .map(|client| (fresh, client))
+                        .map_err(connection_error);
+                }
+            }
+            Err(connection_error(first_error))
+        }
+    }
+}
+
+/// Build a client and perform one harmless API poll so certificate/identity
+/// errors are detected during connection rather than after the operator has
+/// accepted the client as configured.
+fn connect_and_validate(secret: SecretKey, ticket: &str) -> Result<BridgeClient> {
+    let client = BridgeClient::connect(secret, ticket)?;
+    client
+        .fetch_host_microservices()
+        .context("validating bridge connection")?;
+    Ok(client)
+}
+
+fn peer_certificate_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("invalid peer certificate") || message.contains("unknownissuer")
+    })
+}
+
+fn connection_error(error: anyhow::Error) -> String {
+    crate::logging::warn(
+        "bridge",
+        &format!("failed to connect to bridge_microservice: {error:#}"),
+    );
+    format!(
+        "can't reach the bridge hub — it may still be starting, or its ticket is \
+         stale after a COSMOS restart; press Retry ({})",
+        brief(&error)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_certificate_error;
+
+    #[test]
+    fn recognizes_peer_certificate_errors() {
+        let error = anyhow::anyhow!(
+            "connect api/host_microservices: cryptographic handshake failed: error 48: invalid peer certificate: UnknownIssuer"
+        );
+        assert!(peer_certificate_error(&error));
+    }
+
+    #[test]
+    fn does_not_treat_transient_connection_errors_as_stale_certificates() {
+        let error = anyhow::anyhow!("connect api/host_microservices: timed out");
+        assert!(!peer_certificate_error(&error));
+    }
 }
