@@ -112,7 +112,7 @@ description = "OpenC3 COSMOS native launcher and manager"
 long-description = "Installs and manages a complete OpenC3 COSMOS environment: a Docker engine, an isolated Python runtime, and the COSMOS containers. Runs as a GUI by default or fully headless from the command line."
 authors = ["OpenC3, Inc."]
 homepage = "https://openc3.com"
-license-file = "../LICENSE.md"
+license-file = "LICENSE.md"
 category = "Utility"
 # App/installer icons, generated from assets/icon.png by tools/gen_app_icons.py.
 # AppImage requires a square PNG; macOS uses the .icns and Windows the .ico.
