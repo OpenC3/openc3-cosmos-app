@@ -307,10 +307,19 @@ pub fn spawn_cosmos_check_once(
     });
 }
 
+/// Result of an in-app update attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallReleaseOutcome {
+    /// A downloaded native installer was successfully launched.
+    InstallerLaunched,
+    /// No native installer matched, so the release page was opened instead.
+    ReleasePageOpened,
+}
+
 /// Install a release: download the installer matching this platform/arch and
 /// launch it (the OS installer takes over — a running app can't cleanly replace
 /// itself). If no asset matches, open the release page so the user can pick one.
-pub fn install_release(rel: &Release) -> Result<()> {
+pub fn install_release(rel: &Release) -> Result<InstallReleaseOutcome> {
     match select_asset(&rel.assets) {
         Some(asset) => {
             let dest = std::env::temp_dir().join(&asset.name);
@@ -318,14 +327,15 @@ pub fn install_release(rel: &Release) -> Result<()> {
             crate::download::to_file(&asset.url, &dest)?;
             crate::install::progress("Launching the installer…");
             launch_installer(&dest)?;
-            crate::install::progress(
-                "Installer launched. Complete it, then restart OpenC3 COSMOS to run the new version.",
-            );
-            Ok(())
+            crate::install::progress("Installer launched. Closing OpenC3 COSMOS…");
+            Ok(InstallReleaseOutcome::InstallerLaunched)
         }
         None => {
-            crate::install::progress("No matching installer for this platform; opening the release page…");
-            crate::commands::open_browser(&rel.url)
+            crate::install::progress(
+                "No matching installer for this platform; opening the release page…",
+            );
+            crate::commands::open_browser(&rel.url)?;
+            Ok(InstallReleaseOutcome::ReleasePageOpened)
         }
     }
 }

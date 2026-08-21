@@ -182,9 +182,11 @@ are review-verified only** — call that out and lean on the standard APIs.
   page's tick surfaces an **Update available** modal when the release is newer
   than `env!("CARGO_PKG_VERSION")` and isn't the `settings.skipped_version`.
   **Install** downloads the platform/arch installer asset and launches it
-  (`open` dmg / `start` msi / `xdg-open` deb), falling back to opening the release
-  page; **Skip this version** persists to settings; **Later** dismisses until the
-  next check. The Settings page also has a **Check for updates now** button
+  (`open` dmg / `start` msi / `xdg-open` deb), then cleanly shuts down the app so
+  the installer can replace it. It falls back to opening the release page (without
+  quitting) when no native asset matches; **Skip this version** persists to
+  settings; **Later** dismisses until the next check. The Settings page also has
+  a **Check for updates now** button
   (`update::check_now` → `CheckOutcome`), which reports even when up-to-date/failed
   (via the dialog popup) and ignores the skip preference. Release tags are
   `v<semver>` — `strip_tag` normalizes them; keep `DEFAULT_REPO` in sync with the

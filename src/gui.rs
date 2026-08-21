@@ -189,6 +189,9 @@ struct Shared {
     update_checking: bool,
     /// Result of a manual update check, consumed by the UI on the next tick.
     update_check: Option<crate::update::CheckOutcome>,
+    /// A native app installer was launched successfully. Once its worker has
+    /// finished cleanup, the UI consumes this and shuts the app down cleanly.
+    update_installer_launched: bool,
 }
 
 struct State {
@@ -659,7 +662,8 @@ impl State {
         });
     }
 
-    fn drain_shared(&mut self) {
+    fn drain_shared(&mut self) -> bool {
+        let mut quit_after_update = false;
         // Refresh the log table from the captured-log sink unless paused.
         if !self.log_paused {
             self.log_records = crate::logging::snapshot();
@@ -726,7 +730,15 @@ impl State {
                     }
                 }
             }
+            // Wait for the worker to finish clearing its notifier state before
+            // exiting the process. The fallback release-page path never sets
+            // this flag, so the app remains open in that case.
+            if s.update_installer_launched && !s.busy {
+                s.update_installer_launched = false;
+                quit_after_update = true;
+            }
         }
+        quit_after_update
     }
 
     /// Fetch a service's logs on a background thread; the result is picked up by
@@ -746,7 +758,9 @@ impl State {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
-                self.drain_shared();
+                if self.drain_shared() {
+                    return self.quit();
+                }
                 // A COSMOS install or upgrade can change the version-derived
                 // default while the app is open. Start/stop the bridge once the
                 // background task has finished, unless Settings is being edited.
@@ -923,7 +937,16 @@ impl State {
             Message::UpdateInstall => {
                 if let Some(rel) = self.update_available.take() {
                     let label = format!("Installing update {}", rel.version);
-                    self.spawn(&label, move || crate::update::install_release(&rel));
+                    let shared = self.shared.clone();
+                    self.spawn(&label, move || {
+                        let outcome = crate::update::install_release(&rel)?;
+                        if outcome == crate::update::InstallReleaseOutcome::InstallerLaunched {
+                            if let Ok(mut s) = shared.lock() {
+                                s.update_installer_launched = true;
+                            }
+                        }
+                        Ok(())
+                    });
                 }
                 Task::none()
             }
