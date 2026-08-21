@@ -11,13 +11,17 @@
 
 # Builds the native installers on each OS/arch (native runners, since a .dmg
 # needs macOS and a .msi/WiX needs Windows). Run it manually (workflow_dispatch)
-# to build without publishing — installers land as artifacts; pushing a
-# `v*` tag additionally attaches them to a GitHub Release.
+# to set and commit the app version, build the installers, create the matching
+# `v*` tag, and publish the installers on a GitHub Release.
 name: openc3-cosmos-app Release Packages
 
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "App version to set (SemVer without a leading v)"
+        type: string
+        required: true
       target:
         description: "Which target to build"
         type: choice
@@ -26,12 +30,8 @@ on:
           - all
           - linux-x86_64
           - linux-arm64
-          - macos-x86_64
           - macos-arm64
           - windows-x86_64
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -41,8 +41,85 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Compute the build matrix so a manual run can target a single OS/arch (the
-  # `target` input); tag pushes always build everything.
+  version:
+    name: Set app version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the version bump on manual runs
+    outputs:
+      sha: ${{ steps.build_ref.outputs.sha }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set and commit the app version
+        env:
+          VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$REF_TYPE" != "branch" ]; then
+            echo "::error::Run the manual release workflow from a branch so the version commit can be pushed."
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+[-+0-9A-Za-z.]*$ ]]; then
+            echo "::error::Version must be valid SemVer without a leading v (for example, 1.2.3 or 1.2.3-rc.1)."
+            exit 1
+          fi
+
+          awk '
+            $0 == "[package]" { app_package = 1 }
+            app_package && /^version = / {
+              print "version = \"" ENVIRON["VERSION"] "\""
+              app_package = 0
+              updated = 1
+              next
+            }
+            { print }
+            END { if (!updated) exit 1 }
+          ' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          awk '
+            $0 == "name = \"openc3-cosmos-app\"" { app_package = 1 }
+            app_package && /^version = / {
+              print "version = \"" ENVIRON["VERSION"] "\""
+              app_package = 0
+              updated = 1
+              next
+            }
+            { print }
+            END { if (!updated) exit 1 }
+          ' Cargo.lock > Cargo.lock.new
+          mv Cargo.lock.new Cargo.lock
+
+          # Have Cargo validate the version and the edited manifest/lockfile.
+          metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+          actual=$(echo "$metadata" | jq -r '.packages[] | select(.name == "openc3-cosmos-app") | .version')
+          if [ "$actual" != "$VERSION" ]; then
+            echo "::error::Cargo resolved app version '$actual', expected '$VERSION'."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "App version is already $VERSION; no commit needed."
+          else
+            git commit -m "Set app version to $VERSION"
+            git push origin "HEAD:refs/heads/$REF_NAME"
+          fi
+
+      - name: Select the build commit
+        id: build_ref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Compute the build matrix so a manual run can target a single OS/arch.
   setup:
     name: Select targets
     runs-on: ubuntu-latest
@@ -56,16 +133,13 @@ jobs:
       - name: Build the target matrix
         id: pick
         env:
-          TARGET: ${{ github.event.inputs.target || 'all' }}
+          TARGET: ${{ inputs.target }}
         run: |
-          # macOS x86_64 is cross-compiled on an Apple-Silicon runner: the free
-          # Intel runner (macos-13) was retired Dec 2025, and Intel on Actions
-          # ends entirely in 2027. Each job builds an explicit --target so the
+          # Each job builds an explicit --target so the
           # build arch is independent of the runner arch.
           all='[
             {"runner":"ubuntu-latest","name":"linux-x86_64","rust_target":"x86_64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
             {"runner":"ubuntu-24.04-arm","name":"linux-arm64","rust_target":"aarch64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
-            {"runner":"macos-14","name":"macos-x86_64","rust_target":"x86_64-apple-darwin","packager_args":"-f dmg"},
             {"runner":"macos-14","name":"macos-arm64","rust_target":"aarch64-apple-darwin","packager_args":"-f dmg"},
             {"runner":"windows-latest","name":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc","packager_args":"-f wix"}
           ]'
@@ -79,7 +153,7 @@ jobs:
 
   build:
     name: ${{ matrix.name }}
-    needs: setup
+    needs: [version, setup]
     runs-on: ${{ matrix.runner }}
     # Backstop against a hung notarization running to the 6-hour job default.
     # The notarize step below bounds each `notarytool submit` with --timeout and
@@ -97,6 +171,8 @@ jobs:
           egress-policy: audit
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
 
       - name: Install/refresh the Rust toolchain
         run: |
@@ -319,7 +395,7 @@ jobs:
   deb-smoke-test:
     name: .deb install smoke test
     needs: build
-    if: ${{ github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == 'linux-x86_64' }}
+    if: ${{ inputs.target == 'all' || inputs.target == 'linux-x86_64' }}
     runs-on: ubuntu-latest
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -359,9 +435,13 @@ jobs:
           '
 
   release:
-    name: Attach to GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Create tag and GitHub Release
+    needs: [version, build, deb-smoke-test]
+    if: >-
+      ${{ always() &&
+          needs.version.result == 'success' &&
+          needs.build.result == 'success' &&
+          (needs.deb-smoke-test.result == 'success' || needs.deb-smoke-test.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write # create/upload the release
@@ -371,6 +451,32 @@ jobs:
         with:
           egress-policy: audit
 
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Create and push the release tag
+        env:
+          BUILD_SHA: ${{ needs.version.outputs.sha }}
+          TAG: v${{ inputs.version }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            tagged_sha=$(git rev-list -n 1 "$TAG")
+            if [ "$tagged_sha" != "$BUILD_SHA" ]; then
+              echo "::error::Tag $TAG already points to $tagged_sha instead of this release commit $BUILD_SHA."
+              exit 1
+            fi
+            echo "Tag $TAG already points to the release commit; reusing it."
+          else
+            git tag -a "$TAG" "$BUILD_SHA" -m "openc3-cosmos-app $TAG"
+            git push origin "refs/tags/$TAG"
+          fi
+
       - name: Download built installers
         run: gh run download "$GITHUB_RUN_ID" --dir artifacts
         env:
@@ -378,12 +484,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
 
       - name: Create/update the release and upload installers
-        run: |
-          files=$(find artifacts -type f)
-          echo "Attaching:"; echo "$files"
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "openc3-cosmos-app $GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" $files --clobber
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: v${{ inputs.version }}
+        run: |
+          files=$(find artifacts -type f)
+          echo "Attaching:"; echo "$files"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "openc3-cosmos-app $TAG" --generate-notes
+          gh release upload "$TAG" $files --clobber

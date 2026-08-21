@@ -129,11 +129,11 @@ All building happens inside Docker, so the only host requirement is Docker.
 
 Supported targets:
 
-| Platform | Targets | Toolchain |
-| --- | --- | --- |
-| Linux | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | cargo-zigbuild |
-| Windows | `x86_64-pc-windows-gnu` | cargo-zigbuild |
-| macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | cargo-zigbuild + macOS SDK |
+| Platform | Targets                                                 | Toolchain                  |
+| -------- | ------------------------------------------------------- | -------------------------- |
+| Linux    | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | cargo-zigbuild             |
+| Windows  | `x86_64-pc-windows-gnu`                                 | cargo-zigbuild             |
+| macOS    | `aarch64-apple-darwin`                                  | cargo-zigbuild + macOS SDK |
 
 (Windows uses the GNU ABI so cargo-zigbuild can compile the C/assembly in
 transitive dependencies such as `ring`, which the Iroh bridge pulls in.)
@@ -142,7 +142,7 @@ macOS targets require a macOS SDK (which cannot be redistributed in the image).
 Provide one with `MACOS_SDK`:
 
 ```bash
-MACOS_SDK=/path/to/MacOSX.sdk ./build.sh x86_64-apple-darwin aarch64-apple-darwin
+MACOS_SDK=/path/to/MacOSX.sdk ./build.sh aarch64-apple-darwin
 ```
 
 ### Native installers
@@ -162,11 +162,11 @@ lands in `dist/installers/`.
 powershell -ExecutionPolicy Bypass -File .\package.ps1
 ```
 
-| Host | Produces |
-| --- | --- |
-| macOS | `OpenC3 COSMOS.app` + `OpenC3 COSMOS_<ver>_<arch>.dmg` |
-| Linux | `.deb`, `.AppImage` |
-| Windows | `.msi` (WiX) and/or `.exe` (NSIS) |
+| Host    | Produces                                               |
+| ------- | ------------------------------------------------------ |
+| macOS   | `OpenC3 COSMOS.app` + `OpenC3 COSMOS_<ver>_<arch>.dmg` |
+| Linux   | `.deb`, `.AppImage`                                    |
+| Windows | `.msi` (WiX) and/or `.exe` (NSIS)                      |
 
 The architecture matches the build host (e.g. `aarch64` on Apple Silicon). To
 produce Linux installers from a non-Linux host, run `./package.sh` inside a

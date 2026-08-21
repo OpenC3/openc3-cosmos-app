@@ -30,7 +30,6 @@ ALL_TARGETS=(
   x86_64-unknown-linux-gnu
   aarch64-unknown-linux-gnu
   x86_64-pc-windows-gnu
-  x86_64-apple-darwin
   aarch64-apple-darwin
 )
 
@@ -110,9 +109,7 @@ build_one() {
 
     # macOS arm64 binaries linked by LLD/zig carry a "linker-signed" ad-hoc
     # signature that AMFI rejects at exec time, so they MUST be re-signed with a
-    # plain ad-hoc signature. x86_64 binaries are emitted without a signature
-    # (and none is required to run), and LLD leaves no header room for one, so
-    # rcodesign can fail there with "insufficient room"; that's tolerable.
+    # plain ad-hoc signature.
     echo "Re-signing $target binary (ad-hoc) with rcodesign..."
     if rcodesign sign "$src" "$dest"; then
       :
@@ -122,7 +119,6 @@ build_one() {
         return 1
       fi
       echo "WARNING: ad-hoc signing failed for $target; staging the unsigned binary" >&2
-      echo "         (x86_64 macOS binaries run unsigned; sign on a Mac for distribution)." >&2
       cp "$src" "$dest"
     fi
   else
