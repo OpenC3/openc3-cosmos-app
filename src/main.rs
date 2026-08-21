@@ -87,8 +87,10 @@ fn main() {
 /// Ensure the standard macOS tool directories (Homebrew, Docker) are on PATH.
 /// A GUI launch from Finder/Launchpad gets only a minimal PATH, which hides the
 /// `docker` CLI so engine detection and `docker compose` fail. Appends the
-/// well-known locations (existing entries keep priority) so they're found. No-op
-/// on other platforms and harmless when launched from a terminal.
+/// well-known locations (existing entries keep priority) so they're found. Add
+/// them even when they do not exist yet: Docker can be installed while this app
+/// is running, and the same process must find its CLI afterward. No-op on other
+/// platforms and harmless when launched from a terminal.
 #[cfg(target_os = "macos")]
 fn ensure_tool_path() {
     use std::path::PathBuf;
@@ -108,7 +110,7 @@ fn ensure_tool_path() {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&current).collect();
     for dir in candidates {
-        if dir.is_dir() && !dirs.contains(&dir) {
+        if !dirs.contains(&dir) {
             dirs.push(dir);
         }
     }
