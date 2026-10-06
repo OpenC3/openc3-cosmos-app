@@ -695,13 +695,47 @@ pub fn python(ctx: &Context) -> Result<()> {
     process::run(&mut mkvenv)?;
 
     // Note: the bridge `iroh` package is installed per-microservice into each
-    // service's own venv by the operator, not into this base venv.
+    // service's own venv by the operator, not into this base venv. Pre-cache
+    // those packages now (while online) so the operator can still provision
+    // host venvs from uv's cache if the host is offline later.
+    prewarm_host_packages(&uv, &cache, &install_dir, &ctx.paths.python);
 
     notify(format!(
         "Isolated Python environment ready at {}",
         ctx.paths.python.display()
     ));
     Ok(())
+}
+
+/// Populate uv's cache with the host microservice packages (openc3, iroh and
+/// their dependencies) by installing them into a throwaway venv. The cache is
+/// shared with the operator, which falls back to `uv pip install --offline` when
+/// PyPI is unreachable. Best-effort: a failure only loses offline support.
+fn prewarm_host_packages(uv: &Path, cache: &Path, install_dir: &Path, python_dir: &Path) {
+    notify("Caching openc3 Python packages for offline use".to_string());
+    let scratch = python_dir.join(".prewarm-venv");
+    let result = (|| -> Result<()> {
+        let mut mkvenv = Command::new(uv);
+        mkvenv
+            .args(["venv", "--clear", "--python", DEFAULT_PYTHON])
+            .arg(&scratch)
+            .env("UV_PYTHON_INSTALL_DIR", install_dir)
+            .env("UV_CACHE_DIR", cache);
+        process::run(&mut mkvenv)?;
+        let mut install = Command::new(uv);
+        install
+            .args(["pip", "install", "--python"])
+            .arg(&scratch)
+            .args(crate::operator::HOST_PYTHON_PACKAGES)
+            .env("UV_CACHE_DIR", cache);
+        process::run(&mut install)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    if let Err(e) = result {
+        notify(format!(
+            "Warning: could not cache openc3 Python packages ({e:#}); host interfaces will need network access on first start"
+        ));
+    }
 }
 
 /// Ensure the `uv` binary exists under `<root>/bin`, downloading the standalone

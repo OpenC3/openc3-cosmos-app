@@ -259,6 +259,7 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
             || !config.pip_projects.is_empty()
     };
 
+    let mut installed = true;
     if let Some(uv) = locate_uv(python_dir) {
         let mut create = Command::new(&uv);
         create
@@ -272,14 +273,30 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
             .env("UV_CACHE_DIR", &cache);
         if process::run(&mut create).is_err() {
             log_error("MicroserviceOperator", "failed to create venv with uv");
+            installed = false;
         }
         if has_installs(&config.python_packages) {
-            let mut install = Command::new(&uv);
-            install.args(["pip", "install", "--python"]).arg(&interpreter);
-            add_packages(&mut install);
-            extra_targets(&mut install);
-            install.env("UV_CACHE_DIR", &cache);
-            let _ = process::run(&mut install);
+            let uv_install = |offline: bool| {
+                let mut install = Command::new(&uv);
+                install.args(["pip", "install", "--python"]).arg(&interpreter);
+                if offline {
+                    install.arg("--offline");
+                }
+                add_packages(&mut install);
+                extra_targets(&mut install);
+                install.env("UV_CACHE_DIR", &cache);
+                process::run(&mut install)
+            };
+            // If PyPI is unreachable (e.g. the host is offline), retry using
+            // only uv's local cache, which `install::python` pre-warms with
+            // openc3 and its dependencies (and every online install refreshes).
+            installed = uv_install(false).is_ok() || {
+                log_info(
+                    "MicroserviceOperator",
+                    "Package install failed; retrying offline from the local uv cache",
+                );
+                uv_install(true).is_ok()
+            };
         }
     } else {
         // Fall back to the base venv interpreter's stdlib venv + pip.
@@ -290,11 +307,21 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
             install.arg("-m").arg("pip").arg("install");
             add_packages(&mut install);
             extra_targets(&mut install);
-            let _ = process::run(&mut install);
+            installed = process::run(&mut install).is_ok();
         }
     }
-    // Record the inputs we installed so we can skip/refresh next time.
-    let _ = std::fs::write(&fingerprint_file, &fingerprint);
+    // Record the inputs we installed so we can skip/refresh next time. On
+    // failure leave the fingerprint unset so the next start retries the install
+    // (e.g. once the host is back online) instead of running an incomplete venv
+    // forever.
+    if installed {
+        let _ = std::fs::write(&fingerprint_file, &fingerprint);
+    } else {
+        log_error(
+            "MicroserviceOperator",
+            &format!("failed to install Python packages into {}", venv_dir.display()),
+        );
+    }
 }
 
 /// The default Python version for provisioned venvs.
@@ -1390,6 +1417,10 @@ impl MicroserviceOperator {
     }
 }
 
+/// Python packages every host microservice venv needs. `install::python`
+/// pre-caches these so host venvs can be provisioned while offline.
+pub const HOST_PYTHON_PACKAGES: &[&str] = &["iroh", "openc3"];
+
 /// The host-side interface runner module (part of the `openc3` Python package),
 /// run in each host microservice's venv.
 const HOST_INTERFACE_MODULE: &str = "openc3.microservices.host_interface_microservice";
@@ -1416,7 +1447,7 @@ fn host_specs_to_configs(specs: Vec<HostSpec>) -> ConfigMap {
         env.insert("OPENC3_NO_STORE".to_string(), "1".to_string());
         let config = MicroserviceConfig {
             python: true,
-            python_packages: vec!["iroh".to_string(), "openc3".to_string()],
+            python_packages: HOST_PYTHON_PACKAGES.iter().map(|p| p.to_string()).collect(),
             stream: Some(spec.stream.clone()),
             cmd: vec![
                 "-u".to_string(),

@@ -38,6 +38,12 @@ control plane (spawn list, authorization, logs, file sync). The actual device
 bytes flow `host_interface_microservice → bridge_microservice → bridge_interface`
 directly over Iroh, paired inside the hub.
 
+The diagram shows the data path only. Each bridged interface also opens a
+**second, parallel pair** — the control channel (`ctrl/<name>` + `hostctrl/<name>`) —
+carrying newline-delimited JSON status and connect/disconnect commands rather
+than device bytes. See §2 for the full ALPN set and §6 for how the two pairs are
+rendezvoused separately.
+
 ---
 
 ## 2. Iroh addressing: identities, tickets, and ALPNs
@@ -60,16 +66,28 @@ Everything is built on three Iroh primitives:
 |------|-----------|---------|
 | `stream/<name>` | COSMOS `bridge_interface` | Data path — COSMOS leg |
 | `host/<name>` | host `host_interface_microservice` | Data path — host leg |
+| `ctrl/<name>` | COSMOS `bridge_interface` | Control channel — COSMOS leg (newline-delimited JSON) |
+| `hostctrl/<name>` | host `host_interface_microservice` | Control channel — host leg (newline-delimited JSON) |
 | `api/host_microservices` | openc3-cosmos-app | Poll the list of host processes to spawn |
 | `api/authorize` | openc3-cosmos-app | Publish the set of authorized host identities |
 | `api/files` | openc3-cosmos-app | Hash-delta sync of the scope's plugin `lib/` files |
 | `api/log` | openc3-cosmos-app | Forward host stdout up into COSMOS logging |
+| `api/interface_status` | openc3-cosmos-app | Latest host `InterfaceStatus` per interface (tapped from the control channel) |
 | `api/enroll` | openc3-cosmos-app | Redeem a one-time manual-enrollment code (remote pairing) |
 
-The data path deliberately uses **two different ALPN prefixes** for the same
-`<name>`: `stream/<name>` (the trusted in-COSMOS leg) and `host/<name>` (the
-host leg). The hub pairs the two legs by `<name>` but enforces identity
-separately on each (see §5).
+The hub advertises a **`stream` / `host` / `ctrl` / `hostctrl` quad per relayed
+stream** (`_build_alpns`), plus the fixed control-API ALPNs. Each channel
+deliberately uses two different prefixes for the same `<name>` — the trusted
+in-COSMOS leg (`stream/`, `ctrl/`) and the host leg (`host/`, `hostctrl/`) — so
+the hub can pair the two legs by `<name>` while enforcing identity separately on
+each (see §5). The data pair and the control pair rendezvous under **distinct
+channel keys** (the control pair is keyed `ctrl/<name>`), so newline-delimited
+JSON can never mix into the raw byte stream.
+
+The advertised set is kept live: every `STREAM_REFRESH_INTERVAL = 5s` the hub
+re-queries its streams from the `HostInterfaceMicroserviceModel`s and
+re-advertises its ALPNs, so a newly deployed bridged interface is picked up
+without the operator having to respawn the hub.
 
 ### The one-byte primer (`PRIME`)
 
@@ -83,7 +101,9 @@ and strip that byte. Everything after it is raw device data.
 How a peer actually reaches the hub depends on what addresses the ticket carries:
 
 - **Local (default).** The hub binds a fixed UDP port
-  (`OPENC3_BRIDGE_PORT_BASE`, default 7799, one per bridge) that the operator
+  (`OPENC3_BRIDGE_PORT_BASE`, default 7799, with `OPENC3_BRIDGE_PORT_COUNT`,
+  default 16, sizing the pool — one port per bridge, assigned once and persisted
+  in `BridgeModel.port` so it is reused across restarts) that the operator
   container publishes on the host's loopback (see `compose.yaml`), and advertises
   `127.0.0.1:<port>` in its ticket (plus its `172.x` container address for
   in-COSMOS peers). A **co-located** openc3-cosmos-app dials `127.0.0.1:<port>` directly.
@@ -120,17 +140,21 @@ directly over `127.0.0.1`, so local pairing stays direct and offline-capable.
 Stored in Redis/Valkey via COSMOS models, scoped per-scope:
 
 - **`BridgeModel`** (`name`, `public_key`, `ticket`, `app_public_key`,
-  `enroll_code`) — one per named bridge. Holds the hub's stable **public** key,
-  its **current ticket** (refreshed each hub start), the enrolled **openc3-cosmos-app
-  public key** authorized for control APIs, and a pending one-time
-  **enrollment code** for manual pairing.
+  `enroll_code`, `enroll_code_generated_at`, `port`) — one per named bridge.
+  Holds the hub's stable **public** key, its **current ticket** (refreshed each
+  hub start), the enrolled **openc3-cosmos-app public key** authorized for control
+  APIs, and a pending one-time **enrollment code** for manual pairing.
+  `enroll_code_generated_at` timestamps that code so it expires after
+  `ENROLLMENT_CODE_TTL_SECONDS = 10 * 60`; a record predating the field has no
+  timestamp and intentionally **fails closed**. `port` is the fixed UDP port
+  this hub binds, assigned once from the published pool and reused thereafter.
 - **`BridgeInterfaceModel`** (`name`, `public_key`) — the public key of each
-  COSMOS-side `bridge_interface`, so the hub can authorize the `stream/<name>`
-  leg.
-- **`HostMicroserviceModel`** — the declarative spawn list: `name`, `bridge_name`,
-  `stream`, `config_params`, `options`, `protocols` (host-side `BRIDGE_PROTOCOL`s),
-  `secret_options`, `env`, `container`, `needs_dependencies`, etc. Created from
-  plugin definitions.
+  COSMOS-side `bridge_interface`, so the hub can authorize that interface's
+  `stream/<name>` and `ctrl/<name>` legs.
+- **`HostInterfaceMicroserviceModel`** — the declarative spawn list: `name`,
+  `bridge_name`, `stream`, `config_params`, `work_dir`, `options`, `protocols`
+  (host-side `BRIDGE_PROTOCOL`s), `secret_options`, `secrets`, `env`,
+  `container`, `needs_dependencies`, etc. Created from plugin definitions.
 - **Secrets store** — the bridge's **private** key, under
   `BRIDGE_<name>_PRIVATE_KEY`. Never leaves COSMOS.
 
@@ -192,13 +216,14 @@ changes take effect without restarting the hub:
    `remote_id()` must equal `BridgeModel.app_public_key`. Only the enrolled
    openc3-cosmos-app may poll the spawn list, authorize hosts, sync files, or forward
    logs. (`bridge_microservice._authorized`)
-2. **COSMOS data leg (`stream/<name>`)** — `remote_id()` must equal
-   `BridgeInterfaceModel(name).public_key`. Each `bridge_interface` registers
-   its per-process public key at connect time.
+2. **COSMOS legs (`stream/<name>` and `ctrl/<name>`)** — `remote_id()` must
+   equal `BridgeInterfaceModel(name).public_key`. Each `bridge_interface`
+   registers its per-process public key at connect time. The control leg is
+   checked with the same rule as the data leg.
    (`bridge_microservice._authorized_interface`)
-3. **Host data leg (`host/<name>`)** — `remote_id()` must be in the in-memory
-   `_authorized_hosts` set, which openc3-cosmos-app publishes each cycle via
-   `api/authorize`.
+3. **Host legs (`host/<name>` and `hostctrl/<name>`)** — `remote_id()` must be
+   in the in-memory `_authorized_hosts` set, which openc3-cosmos-app publishes each
+   cycle via `api/authorize`. Again, both legs share the rule.
 
 ### Ephemeral host identities
 
@@ -225,6 +250,12 @@ a long-lived data-path secret.
 3. The hub's `_rendezvous` pairs the two connections by `<name>`: the first
    arrival parks (up to `PAIR_TIMEOUT = 300s`); the second wires
    `_pump(a.recv → b.send)` both directions until either side closes.
+4. In parallel, the same two processes dial `ctrl/<name>` and `hostctrl/<name>`.
+   These rendezvous under the separate key `ctrl/<name>` and carry
+   newline-delimited JSON rather than device bytes. The hub taps the
+   host → COSMOS direction (`_pump_status`): it forwards every byte unchanged
+   while parsing each line, keeping the newest `{"type": "status", ...}` per
+   interface in `_interface_status` to serve `api/interface_status`.
 
 ### Connection coordination (READY / GO)
 
@@ -291,7 +322,10 @@ openc3-cosmos-app is a single cross-platform binary (Iced GUI + headless CLI). I
 The GUI shows a **bridge status** line ("Connected to COSMOS" / "Not paired…" /
 "COSMOS unreachable…"), a per-host-interface table with each interface's
 **connection state** and **rx/tx byte** counts, and a collapsible **Container
-Status** section.
+Status** section. The per-interface figures come from `api/interface_status`,
+which returns `{ <name>: <status> }` built from the control-channel tap — so the
+launcher reports what the host process actually observes, not what it was asked
+to run.
 
 ### Log forwarding
 
@@ -316,6 +350,7 @@ with configuration passed via environment:
 | `OPENC3_HOST_INTERFACE` | JSON `{config_params, options, protocols}` for the real interface (`protocols` = host-side `BRIDGE_PROTOCOL`s) |
 | `OPENC3_BRIDGE_PRIVATE_KEY` | Ephemeral, openc3-cosmos-app-minted identity (never persisted) |
 | `OPENC3_MICROSERVICE_NAME` | Name used for logging |
+| `OPENC3_BRIDGE_RELAY` | Relay URL, when pairing across NAT (must match the hub's — see §2) |
 | `PYTHONPATH` | Synced plugin `lib/` dirs |
 
 `build_interface()` resolves the real interface class from
@@ -388,7 +423,7 @@ with the host-side changes here. The **app-side** components (`src/...`) live in
 | COSMOS data leg (Python) | `openc3/python/openc3/interfaces/bridge_interface.py` | COSMOS Core |
 | COSMOS data leg (Ruby) | `openc3/lib/openc3/bridge/bridge_interface_thread.rb` | COSMOS Core |
 | Host runner | `openc3/python/openc3/microservices/host_interface_microservice.py` | COSMOS Core |
-| Persistent models | `openc3/python/openc3/models/{bridge_model,bridge_interface_model,host_microservice_model}.py` | COSMOS Core |
+| Persistent models | `openc3/python/openc3/models/{bridge_model,bridge_interface_model,host_interface_microservice_model}.py` | COSMOS Core |
 | Enroll CLI (`bridgeenroll`) | `openc3/bin/openc3cli` | COSMOS Core |
 | App: enrollment & identity | `src/enroll.rs` | this repo |
 | App: hub client (ALPNs, APIs) | `src/bridge.rs` | this repo |
