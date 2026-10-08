@@ -117,7 +117,7 @@ type ConfigMap = BTreeMap<String, MicroserviceConfig>;
 /// operator for display (e.g. in the GUI). Not all fields are read in every
 /// build (the headless binary doesn't render them).
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MicroserviceStatus {
     pub name: String,
     pub scope: String,
@@ -137,7 +137,7 @@ pub struct MicroserviceStatus {
 /// the GUI. `configured` means openc3-cosmos-app is paired (has an identity + a bridge
 /// ticket); `connected` means the most recent hub API call succeeded.
 #[allow(dead_code)] // fields read by the GUI, not the headless binary
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BridgeConnectionStatus {
     pub configured: bool,
     pub connected: bool,

@@ -22,6 +22,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
@@ -49,6 +50,10 @@ fn sink() -> &'static Mutex<VecDeque<LogRecord>> {
     SINK.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECORDS)))
 }
 
+/// Bumped on every change to the captured records, so the GUI can cheaply tell
+/// whether its copy is stale instead of re-cloning the whole sink on a timer.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
 fn push_record(record: LogRecord) {
     if let Ok(mut q) = sink().lock() {
         while q.len() >= MAX_RECORDS {
@@ -56,6 +61,13 @@ fn push_record(record: LogRecord) {
         }
         q.push_back(record);
     }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A counter that changes whenever records are added or cleared. GUI-only consumer.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
 }
 
 /// Snapshot of the captured log records, oldest first. GUI-only consumer.
@@ -73,6 +85,7 @@ pub fn clear() {
     if let Ok(mut q) = sink().lock() {
         q.clear();
     }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The host name, resolved once. COSMOS uses `Socket.gethostname` for

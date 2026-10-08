@@ -2,7 +2,7 @@
 name = "openc3-cosmos-app"
 version = "0.5.3"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.93"
 description = "OpenC3 COSMOS native launcher and manager (installer, container orchestration, GUI/CLI)"
 license = "AGPL-3.0-only"
 repository = "https://github.com/OpenC3/cosmos"
@@ -15,7 +15,7 @@ path = "src/main.rs"
 # The GUI is on by default per the requirements. Build with
 # `--no-default-features` for a smaller headless-only binary.
 default = ["gui"]
-gui = ["dep:iced", "dep:rfd", "dep:image", "dep:fs4"]
+gui = ["dep:gpui-kit", "dep:image", "dep:fs4"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -31,13 +31,12 @@ base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# Use iced's software renderer (tiny-skia) rather than the GPU wgpu backend:
-# adequate for a control panel, needs no GPU drivers at runtime (better for VMs
-# and the cross-built Linux/Windows binaries), and avoids pulling wgpu/metal
-# (and their future-incompat `block` dependency).
-iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio", "image"], optional = true }
+# GPUI (Zed's GPU-accelerated UI framework) plus the gpui-component styled
+# widget library, via the gpui-kit facade which pins a matching GPUI snapshot
+# (the `gpui-pre-*` crates). Needs Rust >= 1.93. Renders with Metal on macOS,
+# DirectX on Windows and Vulkan on Linux.
+gpui-kit = { version = "0.7.1", optional = true }
 # Decode the embedded PNG logo into RGBA for the system-tray icon (GUI only).
-# Already in the tree via iced's "image" feature, so this adds no real build cost.
 image = { version = "0.24", default-features = false, features = ["png"], optional = true }
 # Cross-platform advisory file lock for the single-instance guard (GUI only). A
 # lock file avoids a fixed TCP port (no chance of colliding with another app) and
@@ -53,12 +52,7 @@ iroh-tickets = "1.0.0"
 # reachable. futures-util is for consuming bollard's stats stream.
 bollard = "0.21"
 futures-util = "0.3"
-# Native folder picker for the Development Mode setting (GUI only). The
-# xdg-portal backend avoids a GTK C dependency on Linux (keeping the build
-# pure-Rust/cross-compilable); native dialogs on macOS/Windows.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"], optional = true }
-
-# The software renderer (tiny-skia) and text shaping (cosmic-text) are painfully
+# GPUI's layout (taffy), text shaping and the rest of the dependency tree are
 # slow when built unoptimized, so a debug `cargo run` feels sluggish even though
 # release is snappy. Optimize dependencies (but NOT our own crate, so app-crate
 # incremental builds stay fast and debuggable) so `cargo run` renders at full
@@ -90,7 +84,7 @@ tray-icon = "0.24.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 # Toggle the Dock icon via the NSApplication activation policy when hiding to /
 # showing from the menu-bar tray. objc2 0.6 is already in the tree (tray-icon/
-# winit), so this adds no real build cost.
+# gpui), so this adds no real build cost.
 objc2 = "0.6"
 
 [target.'cfg(windows)'.build-dependencies]
@@ -135,13 +129,13 @@ minimum-system-version = "11.0"
 # also enables notarization.
 signing-identity = "-"
 
-# winit (the GUI's windowing) loads libxkbcommon at runtime via dlopen for
-# keyboard handling on Linux (X11 and Wayland). Because it's dlopen'd it never
-# appears in the binary's dynamic deps, so cargo-packager can't auto-detect it —
-# declare it explicitly so installs pull it in. Minimal images (e.g. some cloud
-# GUI AMIs) don't ship it by default.
+# GPUI's Linux backend needs libxkbcommon (keyboard handling on X11 and
+# Wayland), fontconfig/freetype (font discovery) and a Vulkan loader (GPU
+# rendering; the Vulkan loader is dlopen'd so cargo-packager can't auto-detect
+# it). Declare them explicitly so installs pull them in — minimal images (e.g.
+# some cloud GUI AMIs) don't ship them by default.
 [package.metadata.packager.deb]
-depends = ["libxkbcommon0", "libxkbcommon-x11-0"]
+depends = ["libxkbcommon0", "libxkbcommon-x11-0", "libfontconfig1", "libfreetype6", "libvulkan1"]
 
 # Bundle the same libs into the AppImage so it's self-contained. They're located
 # on the build machine via `find -L /usr/lib* -name <lib>`, so libxkbcommon must
