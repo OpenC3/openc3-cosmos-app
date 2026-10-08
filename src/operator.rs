@@ -42,6 +42,11 @@ const CYCLE_TIME: Duration = Duration::from_secs(5);
 const PROCESS_SHUTDOWN: Duration = Duration::from_secs(5);
 /// Default max number of new/changed processes to (re)start per cycle.
 const MAX_START_PER_CYCLE: usize = 5;
+/// How often live status (process liveness + the host InterfaceStatus the hub
+/// relays) is refreshed between cycles. Host microservices push status to the
+/// hub immediately on a change and at least every second, so this keeps the
+/// GUI within ~1s of reality without waiting for the full operator cycle.
+const STATUS_REFRESH: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Microservice configuration
@@ -400,6 +405,8 @@ pub struct OperatorProcess {
     stderr_buf: Arc<Mutex<CapturedOutput>>,
     /// When set, each stdout line is also forwarded up to COSMOS (api/log).
     log_tx: Option<UnboundedSender<String>>,
+    /// Ties the running child to our lifetime (stdin lifeline, Windows job).
+    guard: Option<crate::child_guard::ChildGuard>,
 }
 
 impl OperatorProcess {
@@ -415,6 +422,7 @@ impl OperatorProcess {
             stdout_buf: Arc::new(Mutex::new(CapturedOutput::new())),
             stderr_buf: Arc::new(Mutex::new(CapturedOutput::new())),
             log_tx: None,
+            guard: None,
         }
     }
 
@@ -470,8 +478,13 @@ impl OperatorProcess {
         // Don't pop a console window for each host microservice on Windows (the
         // GUI has no console of its own); stdout/stderr are piped and unaffected.
         crate::process::no_window(&mut command);
+        // Tie the child to our lifetime so it can't outlive us, even if we're
+        // force-killed (see child_guard). Applied after no_window: on Windows it
+        // sets the full creation flags, including CREATE_NO_WINDOW.
+        let prepared = crate::child_guard::prepare(&mut command);
 
         let mut child = command.spawn()?;
+        self.guard = Some(prepared.attach(&mut child)?);
         self.pid = Some(child.id());
         self.instance_name = format!("{}__{}", hostname(), child.id());
         if let Some(out) = child.stdout.take() {
@@ -492,12 +505,17 @@ impl OperatorProcess {
         }
     }
 
-    /// Ask the process to stop gracefully (SIGINT on Unix). On Windows there is
-    /// no SIGINT, so the subsequent hard stop handles it.
-    fn soft_stop(&self) {
+    /// Ask the process to stop gracefully: SIGINT on Unix, and on every
+    /// platform close its stdin lifeline, which the host runner treats as a stop
+    /// request (the only graceful route on Windows, which has no SIGINT for a
+    /// windowless process).
+    fn soft_stop(&mut self) {
         if let Some(pid) = self.pid {
             log_info(&self.scope, &format!("Soft stopping: {}", self.cmd_line()));
             signal_int(pid);
+        }
+        if let Some(guard) = self.guard.as_mut() {
+            guard.request_stop();
         }
     }
 
@@ -507,10 +525,15 @@ impl OperatorProcess {
         let scope = self.scope.clone();
         if let Some(child) = self.child.as_mut() {
             log_info(&scope, &format!("Hard stopping: {line}"));
+            // Windows: kill the whole job (venv launcher *and* interpreter).
+            if let Some(guard) = self.guard.as_mut() {
+                guard.terminate();
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
         self.child = None;
+        self.guard = None;
     }
 
     /// Stream any new output to stdout/stderr, mirroring `output_increment`.
@@ -654,6 +677,15 @@ pub struct MicroserviceOperator {
     /// Result of the most recent successful file sync, re-applied to configs each
     /// cycle so a throttled sync still provides PYTHONPATH / pip inputs.
     last_sync: Option<crate::hostfiles::SyncResult>,
+    /// The host microservice set (as the hub described it, before sync inputs
+    /// are applied) that the cached file sync covers. A different set forces a
+    /// fresh sync before anything from it is started.
+    synced_host_configs: ConfigMap,
+    /// Whether starts are currently held back waiting on a file sync (so the
+    /// notice is logged once, not every cycle).
+    deferring_for_files: bool,
+    /// Our live child PIDs, persisted for other instances' startup sweeps.
+    registry: crate::orphans::ChildRegistry,
 }
 
 /// Establishes (or re-establishes) the bridge connection; returns the hub ticket
@@ -705,7 +737,6 @@ impl MicroserviceOperator {
             shutdown: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(Vec::new())),
             python_dir,
-            microservices_dir,
             bridge_ticket: None,
             bridge_client: None,
             interface_status: std::collections::HashMap::new(),
@@ -720,6 +751,10 @@ impl MicroserviceOperator {
             retry: Arc::new(AtomicBool::new(false)),
             next_file_sync: Instant::now(),
             last_sync: None,
+            synced_host_configs: ConfigMap::new(),
+            deferring_for_files: false,
+            registry: crate::orphans::ChildRegistry::new(&microservices_dir),
+            microservices_dir,
         }
     }
 
@@ -779,8 +814,15 @@ impl MicroserviceOperator {
             }
         }
         if let Some(process) = self.processes.get_mut(name) {
-            if let Err(e) = process.start() {
-                log_error(&scope_of(name), &format!("Failed to start {name}: {e}"));
+            match process.start() {
+                // Record it right away so a concurrent instance's startup
+                // sweep (see orphans) recognizes it as owned.
+                Ok(()) => {
+                    if let Some(pid) = process.pid {
+                        self.registry.add(pid);
+                    }
+                }
+                Err(e) => log_error(&scope_of(name), &format!("Failed to start {name}: {e}")),
             }
         }
     }
@@ -924,12 +966,17 @@ impl MicroserviceOperator {
     /// Refresh the published status snapshot from the current processes.
     fn publish_status(&mut self) {
         let mut list = Vec::with_capacity(self.processes.len());
+        let mut live_pids = std::collections::BTreeSet::new();
         for (name, process) in self.processes.iter_mut() {
             let iface = self.interface_status.get(name);
+            let running = process.alive();
+            if let (true, Some(pid)) = (running, process.pid) {
+                live_pids.insert(pid);
+            }
             list.push(MicroserviceStatus {
                 name: name.clone(),
                 scope: process.scope.clone(),
-                running: process.alive(),
+                running,
                 pid: process.pid,
                 cmd: process.cmd_line(),
                 interface_state: iface
@@ -942,6 +989,7 @@ impl MicroserviceOperator {
         if let Ok(mut status) = self.status.lock() {
             *status = list;
         }
+        self.registry.set(live_pids);
     }
 
     /// Fetch the latest host InterfaceStatus from the hub (best effort). Keeps
@@ -1022,31 +1070,41 @@ impl MicroserviceOperator {
 
     /// Re-sync the scope's plugin files from the hub into `<root>/host_files`,
     /// caching the result in `self.last_sync`. Throttled to [`FILE_SYNC_INTERVAL`]
-    /// (but always runs once, right after pairing, when nothing is cached yet)
     /// because each sync makes the hub scan every plugin gem — doing that every
     /// operator cycle stalled the hub's event loop and made the bridged data
-    /// stream bursty. On failure the previous cache is kept and a retry happens
-    /// next cycle rather than after the full interval.
-    fn maybe_sync_files(&mut self) {
-        let due = self.last_sync.is_none() || Instant::now() >= self.next_file_sync;
-        if !due {
-            return;
+    /// stream bursty. It runs regardless of the throttle when nothing is cached
+    /// yet or when `forced` (the host microservice set changed, so new plugin
+    /// code may be needed). On failure the previous cache is kept and a retry
+    /// happens next cycle rather than after the full interval.
+    ///
+    /// Returns whether the cached files are good enough to start microservices
+    /// from: see [`files_ready`].
+    fn maybe_sync_files(&mut self, forced: bool) -> bool {
+        let have_cache = self.last_sync.is_some();
+        let due = Instant::now() >= self.next_file_sync;
+        if !sync_needed(have_cache, due, forced) {
+            return files_ready(None, have_cache, forced);
         }
         let Some(client) = &self.bridge_client else {
-            return;
+            return files_ready(Some(false), have_cache, forced);
         };
         let host_files_dir = self
             .microservices_dir
             .parent()
             .unwrap_or(&self.microservices_dir)
             .join("host_files");
-        match crate::hostfiles::sync(client, &host_files_dir) {
+        let ok = match crate::hostfiles::sync(client, &host_files_dir) {
             Ok(sync) => {
                 self.last_sync = Some(sync);
                 self.next_file_sync = Instant::now() + FILE_SYNC_INTERVAL;
+                true
             }
-            Err(error) => log_error("bridge", &format!("Failed to sync plugin files: {error}")),
-        }
+            Err(error) => {
+                log_error("bridge", &format!("Failed to sync plugin files: {error}"));
+                false
+            }
+        };
+        files_ready(Some(ok), have_cache, forced)
     }
 
     /// Fetch the desired host microservices from the bridge hub. On a transient
@@ -1073,30 +1131,61 @@ impl MicroserviceOperator {
             }
         };
 
-        let mut configs = host_specs_to_configs(specs);
+        let hub_configs = host_specs_to_configs(specs);
 
         // Sync the scope's plugin files (lib/, requirements, pyproject) so host
         // interfaces can use plugin code, then set each host runner's PYTHONPATH
         // and its venv's pip inputs from the (possibly cached) sync result. The
-        // sync itself is throttled — see maybe_sync_files.
-        self.maybe_sync_files();
-        if let Some(sync) = &self.last_sync {
-            let pythonpath = std::env::join_paths(&sync.lib_dirs)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
-            let requirements: Vec<String> =
-                sync.requirements.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-            let projects: Vec<String> =
-                sync.projects.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-            for config in configs.values_mut() {
-                if let Some(pp) = &pythonpath {
-                    config.env.insert("PYTHONPATH".to_string(), pp.clone());
-                }
-                config.pip_requirements = requirements.clone();
-                config.pip_projects = projects.clone();
-                config.pip_fingerprint = sync.pip_fingerprint.clone();
+        // sync is throttled, but forced when the host microservice set changed:
+        // a new or updated microservice may need plugin files the cache lacks.
+        //
+        // Nothing from a changed set is started until its files are on disk.
+        // Otherwise a new microservice could start without its plugin code (and
+        // crash-loop until the next timed sync), or start with no PYTHONPATH at
+        // all if the very first sync failed. While waiting, the currently
+        // running set is kept as-is and the sync is retried next cycle.
+        let set_changed = hub_configs != self.synced_host_configs;
+        let mut configs = if self.maybe_sync_files(set_changed) {
+            if self.deferring_for_files {
+                self.deferring_for_files = false;
+                log_info("bridge", "Plugin files synced; starting host microservices");
             }
-        }
+            self.synced_host_configs = hub_configs.clone();
+            let mut configs = hub_configs;
+            if let Some(sync) = &self.last_sync {
+                let pythonpath = std::env::join_paths(&sync.lib_dirs)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let requirements: Vec<String> =
+                    sync.requirements.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                let projects: Vec<String> =
+                    sync.projects.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                for config in configs.values_mut() {
+                    if let Some(pp) = &pythonpath {
+                        config.env.insert("PYTHONPATH".to_string(), pp.clone());
+                    }
+                    config.pip_requirements = requirements.clone();
+                    config.pip_projects = projects.clone();
+                    config.pip_fingerprint = sync.pip_fingerprint.clone();
+                }
+            }
+            configs
+        } else {
+            if !self.deferring_for_files {
+                self.deferring_for_files = true;
+                log_warn(
+                    "bridge",
+                    "Waiting for plugin files to sync before starting host microservices",
+                );
+            }
+            // Keep the running set as-is (it already carries its sync inputs and
+            // keys), minus anything COSMOS removed — stopping needs no files.
+            // It's still re-authorized below so the hub, which holds the
+            // authorized set in memory only, keeps accepting those children.
+            let mut running = self.microservices.clone();
+            running.retain(|name, _| hub_configs.contains_key(name));
+            running
+        };
 
         // Mint (or reuse) a per-microservice Iroh identity and hand it to the
         // child via env. The secret is only ever in memory + the child's env.
@@ -1345,7 +1434,7 @@ impl MicroserviceOperator {
     fn shutdown_processes(&mut self, names: &[String]) {
         log_info("MicroserviceOperator", "Commanding soft stops...");
         for name in names {
-            if let Some(process) = self.processes.get(name) {
+            if let Some(process) = self.processes.get_mut(name) {
                 process.soft_stop();
             }
         }
@@ -1375,6 +1464,9 @@ impl MicroserviceOperator {
     /// Run the monitor loop until shutdown is requested, then stop all
     /// processes. Blocks the calling thread.
     pub fn run(&mut self) {
+        // Stop host microservices a previous (crashed / force-killed) run left
+        // behind before starting ours: they'd hold the devices and hub pairings.
+        crate::orphans::sweep(&self.microservices_dir);
         log_info(
             "MicroserviceOperator",
             &format!(
@@ -1405,15 +1497,33 @@ impl MicroserviceOperator {
         log_info("MicroserviceOperator", "shutdown complete");
     }
 
-    /// Sleep for `dur`, waking early if shutdown is requested.
-    fn interruptible_sleep(&self, dur: Duration) {
+    /// Sleep for `dur`, waking early if shutdown is requested. Live status is
+    /// refreshed every [`STATUS_REFRESH`] meanwhile, so it doesn't lag a whole
+    /// cycle behind.
+    fn interruptible_sleep(&mut self, dur: Duration) {
         let start = Instant::now();
+        let mut next_refresh = start + STATUS_REFRESH;
         while start.elapsed() < dur {
             if self.is_shutdown() {
                 return;
             }
+            if Instant::now() >= next_refresh {
+                self.refresh_live_status();
+                next_refresh = Instant::now() + STATUS_REFRESH;
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Cheap between-cycle status refresh: process liveness is a local
+    /// `try_wait`, and the hub is only queried when there are host
+    /// microservices whose interface status could be shown (one small request).
+    fn refresh_live_status(&mut self) {
+        if self.processes.is_empty() {
+            return;
+        }
+        self.refresh_interface_status();
+        self.publish_status();
     }
 }
 
@@ -1423,12 +1533,31 @@ pub const HOST_PYTHON_PACKAGES: &[&str] = &["iroh", "openc3"];
 
 /// The host-side interface runner module (part of the `openc3` Python package),
 /// run in each host microservice's venv.
-const HOST_INTERFACE_MODULE: &str = "openc3.microservices.host_interface_microservice";
+pub const HOST_INTERFACE_MODULE: &str = "openc3.microservices.host_interface_microservice";
 
 /// Convert the host microservice specs from the bridge hub into supervised
 /// microservice configs. Each host interface runs the host interface runner in
 /// its own Python venv; the operator hands it the bridge (hub) ticket and its
 /// stream name so it dials the hub directly on `stream/<name>`.
+/// Whether a plugin-file sync should run now: always when nothing is cached or
+/// the host microservice set changed (`forced`), otherwise when the throttle
+/// interval has elapsed (`due`).
+fn sync_needed(have_cache: bool, due: bool, forced: bool) -> bool {
+    !have_cache || forced || due
+}
+
+/// Whether microservices may be started from the cached plugin files.
+/// `attempt` is the outcome of a sync run this cycle (`None` if none ran).
+/// A successful sync is always good. Without one, the cache only covers the
+/// set it was taken for: fine for an unchanged set (a failed periodic refresh
+/// keeps using it), not for a changed set or when there is no cache at all.
+fn files_ready(attempt: Option<bool>, have_cache: bool, forced: bool) -> bool {
+    match attempt {
+        Some(true) => true,
+        _ => have_cache && !forced,
+    }
+}
+
 fn host_specs_to_configs(specs: Vec<HostSpec>) -> ConfigMap {
     let mut map = ConfigMap::new();
     for spec in specs {
@@ -1467,6 +1596,10 @@ fn log_info(scope: &str, msg: &str) {
     crate::logging::info(scope, msg);
 }
 
+fn log_warn(scope: &str, msg: &str) {
+    crate::logging::warn(scope, msg);
+}
+
 fn log_error(scope: &str, msg: &str) {
     crate::logging::error(scope, msg);
 }
@@ -1474,6 +1607,33 @@ fn log_error(scope: &str, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_sync_is_required_before_starting() {
+        // Nothing cached: always sync, and a failure blocks starts.
+        assert!(sync_needed(false, false, false));
+        assert!(!files_ready(Some(false), false, false));
+        assert!(files_ready(Some(true), false, false));
+    }
+
+    #[test]
+    fn changed_set_forces_sync_and_waits_for_it() {
+        // Cache present, throttle not due, but the host set changed: sync anyway,
+        // and only start once that sync succeeds.
+        assert!(sync_needed(true, false, true));
+        assert!(!files_ready(Some(false), true, true));
+        assert!(files_ready(Some(true), true, true));
+    }
+
+    #[test]
+    fn unchanged_set_uses_cache_between_and_despite_failed_refreshes() {
+        // Throttled: no sync, cache is fine.
+        assert!(!sync_needed(true, false, false));
+        assert!(files_ready(None, true, false));
+        // Periodic refresh failed: keep using the cache for the same set.
+        assert!(sync_needed(true, true, false));
+        assert!(files_ready(Some(false), true, false));
+    }
 
     fn cfg(parent: Option<&str>, enabled: bool) -> MicroserviceConfig {
         MicroserviceConfig {

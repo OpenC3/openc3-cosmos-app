@@ -78,6 +78,21 @@ lto = false
 debug = true
 strip = false
 
+# Tie host-microservice children to the app's lifetime and turn termination
+# signals into a graceful shutdown (see child_guard.rs, lifecycle.rs, orphans.rs).
+# libc and signal-hook are already in the tree via tokio/iroh.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = "0.24.1"
 

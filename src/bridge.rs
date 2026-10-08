@@ -47,6 +47,9 @@ const API_FILES: &[u8] = b"api/files";
 const API_INTERFACE_STATUS: &[u8] = b"api/interface_status";
 /// Upper bound on a small API response we will read.
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+/// Upper bound on one `api/interface_status` round trip. The operator polls it
+/// about once a second between cycles; an unreachable hub must not stall it.
+const INTERFACE_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Upper bound on a file-sync payload (plugin files can be larger).
 const MAX_FILES: usize = 512 * 1024 * 1024;
 
@@ -261,7 +264,7 @@ impl BridgeClient {
     /// taps it from the control channel). Returns the status objects; each
     /// carries the microservice `name` used to match it to a host microservice.
     pub fn fetch_interface_status(&self) -> Result<Vec<InterfaceStatus>> {
-        self.runtime.block_on(async {
+        let fetch = async {
             let conn = self
                 .endpoint
                 .connect(self.addr.clone(), API_INTERFACE_STATUS)
@@ -283,6 +286,11 @@ impl BridgeClient {
             let map: std::collections::BTreeMap<String, InterfaceStatus> =
                 serde_json::from_slice(&data).context("parsing interface_status response")?;
             Ok(map.into_values().collect())
+        };
+        self.runtime.block_on(async {
+            tokio::time::timeout(INTERFACE_STATUS_TIMEOUT, fetch)
+                .await
+                .map_err(|_| anyhow::anyhow!("api/interface_status timed out"))?
         })
     }
 

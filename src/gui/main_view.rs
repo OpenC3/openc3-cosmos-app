@@ -1145,16 +1145,18 @@ impl MainView {
                 h_flex()
                     .gap_4()
                     .items_center()
-                    .child(div().flex_1().child(ui::help(
+                    .child(div().flex_1().min_w_0().child(ui::help(
                         "Remove all COSMOS Docker volumes and data (targets, logs, databases). This \
                          cannot be undone.",
                     )))
                     .child(
-                        Button::new("show-cleanup")
-                            .danger()
-                            .icon(IconName::Trash)
-                            .label("Cleanup…")
-                            .on_click(cx.listener(|view, _, window, cx| view.open_cleanup(window, cx))),
+                        div().flex_shrink_0().child(
+                            Button::new("show-cleanup")
+                                .danger()
+                                .icon(IconName::Trash)
+                                .label("Cleanup…")
+                                .on_click(cx.listener(|view, _, window, cx| view.open_cleanup(window, cx))),
+                        ),
                     ),
             );
 
@@ -1187,7 +1189,7 @@ impl MainView {
                 .label("Done")
                 .on_click(self.act(|s, cx| s.close_settings(cx))),
         );
-        ui::modal("settings-modal", 620., v_flex().flex_1().min_h_0().gap_4().child(header).child(body).child(footer))
+        ui::modal_sized("settings-modal", 620., Some(820.), v_flex().flex_1().min_h_0().gap_4().child(header).child(body).child(footer))
             .into_any_element()
     }
 

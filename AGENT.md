@@ -119,6 +119,24 @@ device  <->  host_interface_microservice (host, spawned by this app's operator)
   (next to the device); plain `PROTOCOL`s run in COSMOS on `bridge_interface`.
 - Host errors → host disconnects and **parks** (does not auto-reconnect); COSMOS
   is authoritative and re-drives the connection.
+- **Host microservices never outlive the app** (an orphan keeps its serial/USB
+  device open and its hub pairing). Layers:
+  - `child_guard.rs`: each child gets a **stdin lifeline** + env
+    `OPENC3_STOP_ON_STDIN_EOF=1`; the runner (`host_interface_microservice.py`,
+    COSMOS repo — **keep the env name in lockstep**) stops on stdin EOF and
+    force-exits after `STOP_GRACE` (10s). Closing stdin is also the graceful
+    stop on Windows. Linux adds `PR_SET_PDEATHSIG` (fires when the *spawning
+    thread* exits — children must be spawned from the operator thread). Windows
+    puts each child in a **Job Object** (kill-on-close), created suspended and
+    resumed after assignment, so the venv launcher's interpreter is contained.
+  - `lifecycle.rs`: SIGTERM/SIGINT/SIGHUP and Windows console events → graceful
+    shutdown (GUI heartbeat → `AppState::quit`; CLI `microservices` → operator
+    shutdown flag). A second signal exits immediately.
+  - macOS Dock-Quit/logout bypass `AppState::quit`; a GPUI `on_app_quit` hook
+    (`gui/mod.rs`) runs a bounded stop instead.
+  - `orphans.rs`: operators record live child PIDs in
+    `microservices/.owners/<app pid>`; on start, `sweep` stops host-runner
+    processes for this install not owned by a live instance.
 
 ## Platform behavior & hard-won lessons
 

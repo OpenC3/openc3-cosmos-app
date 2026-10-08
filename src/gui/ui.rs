@@ -236,6 +236,19 @@ pub fn help(text: impl Into<SharedString>) -> Div {
 /// A full-window modal: a dimmed scrim (which swallows clicks to the page
 /// behind) with `content` centered on a card.
 pub fn modal(id: &'static str, width: f32, content: impl IntoElement) -> Stateful<Div> {
+    modal_sized(id, width, None, content)
+}
+
+/// [`modal`] with an optional fixed card height (still capped to the window).
+/// Content that scrolls internally (a `flex_1` + `min_h_0` body) needs one: a
+/// card with only a max height gives such a body no definite space, so the
+/// layout collapses it to zero.
+pub fn modal_sized(
+    id: &'static str,
+    width: f32,
+    height: Option<f32>,
+    content: impl IntoElement,
+) -> Stateful<Div> {
     div()
         .id(id)
         .absolute()
@@ -252,6 +265,7 @@ pub fn modal(id: &'static str, width: f32, content: impl IntoElement) -> Statefu
             v_flex()
                 .w(px(width))
                 .max_w_full()
+                .when_some(height, |card, height| card.h(px(height)))
                 .max_h_full()
                 .bg(color::surface())
                 .border_1()

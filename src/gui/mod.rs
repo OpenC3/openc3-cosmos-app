@@ -36,6 +36,11 @@ use gpui_kit::{
 };
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Upper bound on stopping host microservices during an OS-initiated exit (the
+/// operator itself hard-kills children 5s after asking them to stop).
+const EXIT_STOP_TIMEOUT: Duration = Duration::from_secs(7);
 
 actions!(openc3, [Quit]);
 
@@ -44,9 +49,9 @@ actions!(openc3, [Quit]);
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
-        Activity, Boxes, Cable, CircleCheckBig, Cloud, Container, Download, FolderSearch, Gauge,
-        KeyRound, Layers, Package, PlugZap, Power, RotateCcw, ScrollText, Server, ShieldCheck,
-        Sparkles, SquareArrowOutUpRight, Terminal, Unplug, Wrench, Zap,
+        Activity, Boxes, Cable, CircleCheckBig, CircleStop, Cloud, Code, Container, Download, FolderSearch, Gauge,
+        KeyRound, Layers, Link2, Package, PlugZap, Power, Rocket, RotateCcw, ScrollText, Server, ShieldCheck,
+        Sparkles, SquareArrowOutUpRight, Terminal, Trash, Unplug, Wrench, Zap,
     ]
 );
 
@@ -101,6 +106,9 @@ pub fn launch(root_override: Option<PathBuf>, enterprise: bool) -> anyhow::Resul
     // Tiny local file read, done before the event loop starts.
     let settings = crate::settings::Settings::load(&ctx);
 
+    // Termination signals / console events trigger a graceful shutdown.
+    crate::lifecycle::install();
+
     let app = gpui_kit::application()
         .with_assets(AppAssets)
         // Closing the main window hides to the tray; only an explicit Quit exits.
@@ -133,6 +141,28 @@ pub fn launch(root_override: Option<PathBuf>, enterprise: bool) -> anyhow::Resul
             items: vec![MenuItem::action("Quit OpenC3 COSMOS", Quit)],
             disabled: false,
         }]);
+
+        // An exit we didn't initiate (macOS Dock "Quit", logout/shutdown) skips
+        // AppState::quit. Stop the host microservices here instead. This is the
+        // one place the UI thread waits on blocking work, deliberately: the
+        // process is terminating and the windows are already gone, and the stop
+        // runs on a worker with a bound so a stuck operator can't hang the exit.
+        // (After our own Quit, `stop_for_exit` has nothing left to do.)
+        cx.on_app_quit({
+            let state = state.clone();
+            move |cx| {
+                if let Some(stop) = state.update(cx, |state, _| state.stop_for_exit()) {
+                    let (done_tx, done_rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        stop();
+                        let _ = done_tx.send(());
+                    });
+                    let _ = done_rx.recv_timeout(EXIT_STOP_TIMEOUT);
+                }
+                async {}
+            }
+        })
+        .detach();
 
         // Keep the model's window handles in sync however a window goes away.
         cx.on_window_closed({

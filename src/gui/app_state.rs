@@ -437,6 +437,13 @@ impl AppState {
     fn heartbeat(&mut self, cx: &mut Cx<Self>) {
         let mut changed = false;
 
+        // SIGTERM/SIGINT/SIGHUP or a Windows console close: shut down the same
+        // way Quit does, so host microservices are stopped, not orphaned.
+        if crate::lifecycle::requested() && !self.quitting {
+            self.quit(cx);
+            return;
+        }
+
         // Log table: re-snapshot only when the sink actually changed.
         let generation = crate::logging::generation();
         if !self.log_paused && generation != self.log_generation {
@@ -1314,11 +1321,27 @@ impl AppState {
                     operator.stop();
                 }
                 flush();
+                crate::lifecycle::cleanup_finished();
             })
             .await;
             cx.update(|cx| cx.quit());
         })
         .detach();
+    }
+
+    /// For an exit we didn't initiate (macOS: Dock "Quit", logout/shutdown —
+    /// AppKit terminates the app without going through [`Self::quit`]): hand
+    /// back the blocking work that stops the host microservices and flushes
+    /// settings, or `None` if our own quit already did it.
+    pub fn stop_for_exit(&mut self) -> Option<impl FnOnce() + Send + 'static> {
+        self.quitting = true;
+        let operator = self.operator.take()?;
+        crate::logging::info(APP, "Exiting at the system's request; stopping host microservices…");
+        let flush = self.saver.flusher();
+        Some(move || {
+            operator.stop();
+            flush();
+        })
     }
 
     /// The installed COSMOS version for display ("latest (dev)" in dev mode,
