@@ -25,14 +25,14 @@
 //! into a bounded buffer (first N + last N lines) so death messages can be
 //! reported without unbounded memory growth, mirroring `OperatorProcessIO`.
 
-use crate::bridge::{BridgeClient, HostSpec, InterfaceStatus};
+use crate::bridge::{BridgeClient, DiscoveryRunner, DiscoveryRunnerHandle, HostSpec, InterfaceStatus};
 use tokio::sync::mpsc::UnboundedSender;
 use crate::process;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -686,7 +686,24 @@ pub struct MicroserviceOperator {
     deferring_for_files: bool,
     /// Our live child PIDs, persisted for other instances' startup sweeps.
     registry: crate::orphans::ChildRegistry,
+    /// How the bridge client's discovery worker runs discovery requests from
+    /// COSMOS. `None` until the discovery venv is provisioned.
+    discovery_runner: DiscoveryRunnerHandle,
+    /// Discovery venv provisioning state (`DISCOVERY_*`), set by the
+    /// background provisioning thread.
+    discovery_state: Arc<AtomicU8>,
+    /// Earliest instant to (re)try provisioning the discovery venv.
+    next_discovery_provision: Instant,
 }
+
+/// Discovery venv not provisioned (or the last attempt failed).
+const DISCOVERY_IDLE: u8 = 0;
+/// Discovery venv provisioning in progress on a background thread.
+const DISCOVERY_PROVISIONING: u8 = 1;
+/// Discovery venv ready.
+const DISCOVERY_READY: u8 = 2;
+/// Delay before retrying a failed discovery venv provision (e.g. offline).
+const DISCOVERY_PROVISION_RETRY: Duration = Duration::from_secs(60);
 
 /// Establishes (or re-establishes) the bridge connection; returns the hub ticket
 /// and client, or a short human reason for the GUI. Retried while unpaired.
@@ -755,6 +772,9 @@ impl MicroserviceOperator {
             deferring_for_files: false,
             registry: crate::orphans::ChildRegistry::new(&microservices_dir),
             microservices_dir,
+            discovery_runner: Arc::new(Mutex::new(None)),
+            discovery_state: Arc::new(AtomicU8::new(DISCOVERY_IDLE)),
+            next_discovery_provision: Instant::now(),
         }
     }
 
@@ -844,6 +864,7 @@ impl MicroserviceOperator {
     fn apply_connection(&mut self, ticket: String, client: BridgeClient) {
         self.bridge_ticket = Some(ticket);
         self.log_tx = Some(client.log_sender());
+        client.start_discovery(self.discovery_runner.clone());
         self.bridge_client = Some(client);
         self.unpaired_reason = None;
     }
@@ -1107,6 +1128,47 @@ impl MicroserviceOperator {
         files_ready(Some(ok), have_cache, forced)
     }
 
+    /// Keep the discovery runner current: provision the discovery venv in the
+    /// background (so a slow first install never stalls the operator loop), then
+    /// point discovery at it with PYTHONPATH covering the synced plugin libs so
+    /// plugin-provided discovery classes can be found.
+    fn update_discovery(&mut self) {
+        let venv = self.python_dir.join("discovery");
+        let state = self.discovery_state.load(Ordering::SeqCst);
+        if state == DISCOVERY_IDLE && Instant::now() >= self.next_discovery_provision {
+            self.discovery_state.store(DISCOVERY_PROVISIONING, Ordering::SeqCst);
+            self.next_discovery_provision = Instant::now() + DISCOVERY_PROVISION_RETRY;
+            let python_dir = self.python_dir.clone();
+            let venv = venv.clone();
+            let discovery_state = self.discovery_state.clone();
+            let config = discovery_venv_config();
+            std::thread::spawn(move || {
+                ensure_venv(&python_dir, &venv, &config);
+                // ensure_venv only records the fingerprint after a successful
+                // install, so its absence means retry later.
+                let ready = venv.join(".openc3_pip_fingerprint").is_file();
+                discovery_state.store(if ready { DISCOVERY_READY } else { DISCOVERY_IDLE }, Ordering::SeqCst);
+            });
+            return;
+        }
+        if state != DISCOVERY_READY {
+            return;
+        }
+        let mut env = BTreeMap::new();
+        if let Some(sync) = &self.last_sync {
+            if let Ok(pythonpath) = std::env::join_paths(&sync.lib_dirs) {
+                env.insert("PYTHONPATH".to_string(), pythonpath.to_string_lossy().into_owned());
+            }
+        }
+        if let Ok(mut runner) = self.discovery_runner.lock() {
+            *runner = Some(DiscoveryRunner {
+                python: venv_interpreter(&venv),
+                work_dir: venv,
+                env,
+            });
+        }
+    }
+
     /// Fetch the desired host microservices from the bridge hub. On a transient
     /// poll failure the previous set is kept so running processes aren't torn
     /// down; with no bridge configured the set is empty.
@@ -1186,6 +1248,8 @@ impl MicroserviceOperator {
             running.retain(|name, _| hub_configs.contains_key(name));
             running
         };
+
+        self.update_discovery();
 
         // Mint (or reuse) a per-microservice Iroh identity and hand it to the
         // child via env. The secret is only ever in memory + the child's env.
@@ -1530,6 +1594,22 @@ impl MicroserviceOperator {
 /// Python packages every host microservice venv needs. `install::python`
 /// pre-caches these so host venvs can be provisioned while offline.
 pub const HOST_PYTHON_PACKAGES: &[&str] = &["iroh", "openc3"];
+
+/// Python packages for the discovery venv: `openc3` (which provides the
+/// discovery runner and built-in discovery classes, and depends on pyserial)
+/// plus `hidapi`, `zeroconf` and `bleak` for the HID, mDNS and Bluetooth
+/// discovery classes in `openc3/discovery/`.
+pub const DISCOVERY_PYTHON_PACKAGES: &[&str] = &["openc3", "hidapi", "zeroconf", "bleak"];
+
+/// The config used to provision the shared discovery venv.
+fn discovery_venv_config() -> MicroserviceConfig {
+    MicroserviceConfig {
+        python: true,
+        python_packages: DISCOVERY_PYTHON_PACKAGES.iter().map(|p| p.to_string()).collect(),
+        pip_fingerprint: format!("discovery:{}", DISCOVERY_PYTHON_PACKAGES.join(",")),
+        ..MicroserviceConfig::default()
+    }
+}
 
 /// The host-side interface runner module (part of the `openc3` Python package),
 /// run in each host microservice's venv.

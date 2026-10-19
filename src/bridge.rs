@@ -17,6 +17,9 @@
 //!
 //! * `api/host_microservices` — poll the list of host microservices to spawn.
 //! * `api/log` — forward host microservice stdout up so COSMOS logs it too.
+//! * `api/discovery` / `api/discovery_result` — long-poll for discovery requests
+//!   (e.g. "which serial ports exist?"), run them on this host with the Python
+//!   `openc3.discovery` runner, and return the results.
 //!
 //! The raw interface data path does NOT flow through openc3-cosmos-app: each spawned
 //! host interface dials the hub directly on `stream/<name>` and is paired there
@@ -29,6 +32,9 @@ use iroh_tickets::endpoint::EndpointTicket;
 use std::str::FromStr;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -45,6 +51,20 @@ const API_FILES: &[u8] = b"api/files";
 /// ALPN for fetching host InterfaceStatus (tapped by the hub from the control
 /// channel), so openc3-cosmos-app can show host interface status in its bridge section.
 const API_INTERFACE_STATUS: &[u8] = b"api/interface_status";
+/// ALPN for long-polling discovery requests from COSMOS.
+const API_DISCOVERY: &[u8] = b"api/discovery";
+/// ALPN for returning one discovery result to COSMOS.
+const API_DISCOVERY_RESULT: &[u8] = b"api/discovery_result";
+/// Upper bound on one `api/discovery` long-poll. The hub answers within 20s
+/// (with an empty list when idle), so this only trips on a stalled connection.
+const DISCOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on running one discovery. COSMOS gives up after 15s, so a slower
+/// result would never be seen.
+const DISCOVERY_RUN_TIMEOUT: Duration = Duration::from_secs(12);
+/// Delay before re-polling after a failed `api/discovery` poll (hub down).
+const DISCOVERY_RETRY: Duration = Duration::from_secs(5);
+/// Python module that runs a Discovery class and prints its results as JSON.
+const DISCOVERY_RUNNER_MODULE: &str = "openc3.discovery.discovery_runner";
 /// Upper bound on a small API response we will read.
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 /// Upper bound on one `api/interface_status` round trip. The operator polls it
@@ -193,6 +213,27 @@ pub struct InterfaceStatus {
     #[serde(default)]
     pub txbytes: u64,
 }
+
+/// A discovery request from COSMOS: the Python discovery class filename
+/// followed by its parameters, e.g. `["openc3/discovery/serial_discovery.py"]`.
+#[derive(Debug, Deserialize)]
+pub struct DiscoveryRequest {
+    pub id: String,
+    pub discovery: Vec<String>,
+}
+
+/// How to run Python discovery on this host: the interpreter of a venv with
+/// `openc3` installed, plus the environment (PYTHONPATH to synced plugin libs).
+#[derive(Clone, Debug)]
+pub struct DiscoveryRunner {
+    pub python: PathBuf,
+    pub work_dir: PathBuf,
+    pub env: BTreeMap<String, String>,
+}
+
+/// Shared, updatable discovery runner. `None` until the operator has finished
+/// provisioning the discovery venv; requests before then report an error.
+pub type DiscoveryRunnerHandle = Arc<Mutex<Option<DiscoveryRunner>>>;
 
 /// Client connection to the COSMOS `bridge_microservice` hub.
 pub struct BridgeClient {
@@ -352,6 +393,185 @@ impl BridgeClient {
     /// A cloneable sender for forwarding host stdout lines up to COSMOS.
     pub fn log_sender(&self) -> mpsc::UnboundedSender<String> {
         self.log_tx.clone()
+    }
+
+    /// Start answering discovery requests from COSMOS in the background, using
+    /// whatever `runner` currently holds. Runs until this client is dropped.
+    pub fn start_discovery(&self, runner: DiscoveryRunnerHandle) {
+        self.runtime
+            .spawn(discovery_worker(self.endpoint.clone(), self.addr.clone(), runner));
+    }
+}
+
+/// Long-poll the hub for discovery requests and answer each one concurrently.
+async fn discovery_worker(endpoint: Endpoint, addr: EndpointAddr, runner: DiscoveryRunnerHandle) {
+    loop {
+        let requests = match tokio::time::timeout(
+            DISCOVERY_POLL_TIMEOUT,
+            poll_discovery(&endpoint, &addr),
+        )
+        .await
+        {
+            Ok(Ok(requests)) => requests,
+            // Hub unreachable, not enrolled yet, or a stalled poll: back off.
+            _ => {
+                tokio::time::sleep(DISCOVERY_RETRY).await;
+                continue;
+            }
+        };
+        for request in requests {
+            let endpoint = endpoint.clone();
+            let addr = addr.clone();
+            let current = runner.lock().ok().and_then(|runner| runner.clone());
+            tokio::spawn(async move {
+                let result = run_discovery(current, &request.discovery).await;
+                if let Err(error) = post_discovery_result(&endpoint, &addr, &request.id, result).await {
+                    crate::logging::warn("bridge", &format!("Failed to return discovery result: {error}"));
+                }
+            });
+        }
+    }
+}
+
+/// One `api/discovery` long-poll: returns pending requests (possibly none).
+async fn poll_discovery(endpoint: &Endpoint, addr: &EndpointAddr) -> Result<Vec<DiscoveryRequest>> {
+    let conn = endpoint
+        .connect(addr.clone(), API_DISCOVERY)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect api/discovery: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(b"discovery")
+        .await
+        .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+    let _ = send.finish();
+    let data = recv
+        .read_to_end(MAX_RESPONSE)
+        .await
+        .map_err(|e| anyhow::anyhow!("read response: {e}"))?;
+    serde_json::from_slice(&data).context("parsing discovery response")
+}
+
+/// Send one discovery result (`results` list or `error`) back to the hub.
+async fn post_discovery_result(
+    endpoint: &Endpoint,
+    addr: &EndpointAddr,
+    id: &str,
+    result: Result<serde_json::Value, String>,
+) -> Result<()> {
+    let request = match result {
+        Ok(results) => serde_json::json!({ "id": id, "results": results }),
+        Err(error) => serde_json::json!({ "id": id, "error": error }),
+    };
+    let conn = endpoint
+        .connect(addr.clone(), API_DISCOVERY_RESULT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect api/discovery_result: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(request.to_string().as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+    let _ = send.finish();
+    // Drain the small ack so the hub sees a clean close.
+    let _ = recv.read_to_end(MAX_RESPONSE).await;
+    Ok(())
+}
+
+/// Run `python -m openc3.discovery.discovery_runner <discovery...>` and return
+/// its `results` list, or a short error for COSMOS to show.
+async fn run_discovery(
+    runner: Option<DiscoveryRunner>,
+    discovery: &[String],
+) -> Result<serde_json::Value, String> {
+    let Some(runner) = runner else {
+        return Err("discovery is not ready on the host yet (its Python environment is still being set up)".to_string());
+    };
+    if discovery.is_empty() {
+        return Err("no discovery class given".to_string());
+    }
+    let mut cmd = std::process::Command::new(&runner.python);
+    cmd.arg("-m")
+        .arg(DISCOVERY_RUNNER_MODULE)
+        .args(discovery)
+        .envs(&runner.env)
+        .current_dir(&runner.work_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::process::no_window(&mut cmd);
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let output = match tokio::time::timeout(DISCOVERY_RUN_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(format!("failed to run discovery: {error}")),
+        Err(_) => return Err(format!("discovery timed out after {}s", DISCOVERY_RUN_TIMEOUT.as_secs())),
+    };
+    parse_discovery_output(&output.stdout, &output.stderr)
+}
+
+/// Interpret the runner's stdout (`{"results": [...]}` or `{"error": "..."}`).
+fn parse_discovery_output(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+    let parsed: Option<serde_json::Value> = String::from_utf8_lossy(stdout)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str(line).ok());
+    match parsed {
+        Some(value) if value.get("results").is_some() => Ok(value["results"].clone()),
+        Some(value) if value.get("error").is_some() => {
+            Err(value["error"].as_str().unwrap_or("discovery failed").to_string())
+        }
+        // No JSON at all, e.g. Python failed to start or openc3 isn't installed
+        _ => {
+            let stderr = String::from_utf8_lossy(stderr);
+            let last = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output");
+            Err(format!("discovery failed: {last}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_discovery_results() {
+        let results = parse_discovery_output(
+            b"{\"results\": [{\"value\": \"COM3\", \"text\": \"COM3\"}]}\n",
+            b"",
+        )
+        .unwrap();
+        assert_eq!(results, serde_json::json!([{ "value": "COM3", "text": "COM3" }]));
+    }
+
+    #[test]
+    fn parses_discovery_errors() {
+        let error = parse_discovery_output(b"{\"error\": \"RuntimeError: no hidapi\"}\n", b"").unwrap_err();
+        assert_eq!(error, "RuntimeError: no hidapi");
+    }
+
+    #[test]
+    fn reports_stderr_when_no_json() {
+        let error = parse_discovery_output(
+            b"",
+            b"Traceback (most recent call last):\nModuleNotFoundError: No module named 'openc3'\n",
+        )
+        .unwrap_err();
+        assert_eq!(error, "discovery failed: ModuleNotFoundError: No module named 'openc3'");
+    }
+
+    #[test]
+    fn discovery_not_ready_without_runner() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime
+            .block_on(run_discovery(None, &["openc3/discovery/serial_discovery.py".to_string()]))
+            .unwrap_err();
+        assert!(error.contains("not ready"));
     }
 }
 

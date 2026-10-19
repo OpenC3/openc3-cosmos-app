@@ -44,7 +44,7 @@ image = { version = "0.24", default-features = false, features = ["png"], option
 fs4 = { version = "0.13", optional = true }
 # Iroh peer-to-peer bridge between the app and host microservices.
 iroh = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "sync", "time", "macros", "process"] }
 iroh-tickets = "1.0.0"
 # Talk to the Docker Engine API directly over its socket / named pipe for the
 # status+stats poll (see monitor.rs / dockerapi.rs) instead of spawning a

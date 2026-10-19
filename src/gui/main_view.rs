@@ -815,8 +815,8 @@ impl MainView {
                     .child(th("State").w(px(110.)))
                     .child(th("PID").w(px(70.)))
                     .child(th("Connection").w(px(140.)))
-                    .child(th("Rx").w(px(90.)))
-                    .child(th("Tx").w(px(90.))),
+                    .child(th("Rx").w(px(110.)))
+                    .child(th("Tx").w(px(110.))),
             );
         for (i, m) in s.microservices.iter().enumerate() {
             let (state_label, state_tint) =
@@ -826,15 +826,15 @@ impl MainView {
                 Some(other) if !other.is_empty() => ui::pill(other.to_string(), color::warning()).into_any_element(),
                 _ => div().text_color(color::faint()).child("—").into_any_element(),
             };
-            let bytes = |v: Option<u64>| v.map(crate::monitor::human_bytes).unwrap_or_else(|| "—".to_string());
+            let bytes = |v: Option<u64>| v.map(|b| b.to_string()).unwrap_or_else(|| "—".to_string());
             table = table.child(
                 table_row(i)
                     .child(td_mono(m.name.clone(), &mono).flex_1().min_w_0())
                     .child(div().w(px(110.)).child(ui::pill(state_label, state_tint)))
                     .child(td_mono(m.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".into()), &mono).w(px(70.)))
                     .child(div().w(px(140.)).child(connection))
-                    .child(td_mono(bytes(m.rxbytes), &mono).w(px(90.)))
-                    .child(td_mono(bytes(m.txbytes), &mono).w(px(90.))),
+                    .child(td_mono(bytes(m.rxbytes), &mono).w(px(110.)))
+                    .child(td_mono(bytes(m.txbytes), &mono).w(px(110.))),
             );
         }
         card = card.child(table);

@@ -141,8 +141,9 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Scan the synced tree for host runner inputs: `<gem>/lib` dirs, and any
-/// `<gem>/requirements.txt` / `<gem>/pyproject.toml`.
+/// Scan the synced tree for host runner inputs: `<gem>/lib` and
+/// `<gem>/targets/<TARGET>/lib` dirs, and any `<gem>/requirements.txt` /
+/// `<gem>/pyproject.toml`.
 fn scan(host_files_dir: &Path) -> SyncResult {
     let mut result = SyncResult::default();
     let gem_dirs = match std::fs::read_dir(host_files_dir) {
@@ -158,6 +159,16 @@ fn scan(host_files_dir: &Path) -> SyncResult {
         if lib.is_dir() {
             result.lib_dirs.push(lib);
         }
+        // Interfaces and their helpers often live in a target's lib dir
+        if let Ok(targets) = std::fs::read_dir(gem_path.join("targets")) {
+            let mut target_libs: Vec<PathBuf> = targets
+                .flatten()
+                .map(|target| target.path().join("lib"))
+                .filter(|lib| lib.is_dir())
+                .collect();
+            target_libs.sort();
+            result.lib_dirs.extend(target_libs);
+        }
         if gem_path.join("requirements.txt").is_file() {
             result.requirements.push(gem_path.join("requirements.txt"));
         }
@@ -166,4 +177,26 @@ fn scan(host_files_dir: &Path) -> SyncResult {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_finds_gem_and_target_lib_dirs() {
+        let root = std::env::temp_dir().join(format!("openc3_hostfiles_{}", std::process::id()));
+        let gem = root.join("plugin-1.0.0");
+        for dir in ["lib", "targets/B/lib", "targets/A/lib", "targets/C/cmd_tlm"] {
+            std::fs::create_dir_all(gem.join(dir)).unwrap();
+        }
+        std::fs::write(gem.join("requirements.txt"), "requests\n").unwrap();
+        let result = scan(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            result.lib_dirs,
+            vec![gem.join("lib"), gem.join("targets/A/lib"), gem.join("targets/B/lib")]
+        );
+        assert_eq!(result.requirements, vec![gem.join("requirements.txt")]);
+    }
 }

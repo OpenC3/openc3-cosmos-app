@@ -241,6 +241,11 @@ pub struct AppState {
     operator_restart_pending: Option<bool>,
     /// Whether the running operator was started with the bridge enabled.
     bridge_operator_enabled: bool,
+    /// Whether the context the operator was last started with had a container
+    /// runtime (`None`: not started yet). The operator's bridge hooks capture
+    /// that context, so it's (re)started once the environment check has
+    /// detected the runtime, and again if runtime availability changes.
+    operator_runtime: Option<bool>,
     /// Shared with the operator; "Retry" sets it to re-arm bridge enrollment.
     bridge_retry: Arc<AtomicBool>,
     pub bridge_pairing: bool,
@@ -366,6 +371,7 @@ impl AppState {
             operator_busy: false,
             operator_restart_pending: None,
             bridge_operator_enabled: false,
+            operator_runtime: None,
             bridge_retry: Arc::new(AtomicBool::new(false)),
             bridge_pairing: false,
             microservices: Vec::new(),
@@ -396,10 +402,9 @@ impl AppState {
             logs_window: None,
         };
         crate::logging::info(APP, "OpenC3 COSMOS control panel ready.");
+        // The host microservice operator starts once this first environment
+        // check has detected the container runtime (see apply_env).
         state.refresh_env(cx);
-        // Start the host microservice operator (it reads the COSMOS .env to
-        // decide whether the bridge is enabled, so it starts on a worker).
-        state.restart_operator(false, cx);
         state
     }
 
@@ -475,6 +480,7 @@ impl AppState {
             && !self.settings_open
             && !self.operator_busy
             && !self.quitting
+            && self.operator_runtime.is_some()
             && self.bridge_enabled() != self.bridge_operator_enabled
         {
             self.restart_operator(false, cx);
@@ -585,6 +591,13 @@ impl AppState {
 
     fn apply_env(&mut self, env: EnvCheck, cx: &mut Cx<Self>) {
         self.ctx.runtime = env.runtime.clone();
+        // Start the operator now that the runtime is known, or restart it if
+        // Docker appeared/disappeared: its bridge auto-enroll captures the
+        // context it was started with, so a runtime-less one could never
+        // enroll ("No container runtime found").
+        if !self.quitting && self.operator_runtime != Some(self.ctx.runtime.is_some()) {
+            self.restart_operator(false, cx);
+        }
         self.installed_cosmos = env.installed_cosmos.clone();
         self.env = Some(env);
         if self.page == Page::Install && !self.busy() && !self.needs_setup() {
@@ -1132,6 +1145,7 @@ impl AppState {
             return;
         }
         self.operator_busy = true;
+        self.operator_runtime = Some(self.ctx.runtime.is_some());
         let ctx = self.ctx.clone();
         let settings = self.settings.clone();
         let retry = self.bridge_retry.clone();
@@ -1180,6 +1194,7 @@ impl AppState {
         }
         self.bridge_pairing = true;
         self.operator_busy = true;
+        self.operator_runtime = Some(self.ctx.runtime.is_some());
         self.settings_open = false;
         self.save_settings();
         crate::logging::info("bridge", "Pairing with COSMOS…");
