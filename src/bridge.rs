@@ -196,6 +196,10 @@ pub struct HostSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub needs_dependencies: bool,
+    /// The plugin's synced files directory (see [`crate::hostfiles`]), whose
+    /// Python dependencies are installed for this microservice.
+    #[serde(default)]
+    pub plugin_files: Option<String>,
 }
 
 /// A host interface's status, as reported over the control channel and tapped by

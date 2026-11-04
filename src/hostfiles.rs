@@ -62,15 +62,47 @@ pub fn sync(client: &BridgeClient, host_files_dir: &Path) -> Result<SyncResult> 
     }
 
     let mut result = scan(host_files_dir);
-    result.pip_fingerprint = pip_fingerprint(&result);
+    result.pip_fingerprint = pip_fingerprint(&result.requirements, &result.projects);
     Ok(result)
+}
+
+impl SyncResult {
+    /// The Python dependency inputs of one plugin's synced files directory
+    /// (all plugins' when `None`), with their own fingerprint.
+    pub fn dependencies(&self, plugin_files: Option<&str>) -> SyncResult {
+        let Some(plugin_files) = plugin_files else {
+            return self.clone();
+        };
+        let in_plugin = |dir: Option<&Path>| {
+            dir.and_then(|d| d.file_name())
+                .is_some_and(|name| name == plugin_files)
+        };
+        let requirements: Vec<PathBuf> = self
+            .requirements
+            .iter()
+            .filter(|path| in_plugin(path.parent()))
+            .cloned()
+            .collect();
+        let projects: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .filter(|dir| in_plugin(Some(dir)))
+            .cloned()
+            .collect();
+        SyncResult {
+            lib_dirs: self.lib_dirs.clone(),
+            pip_fingerprint: pip_fingerprint(&requirements, &projects),
+            requirements,
+            projects,
+        }
+    }
 }
 
 /// Fingerprint the venv-affecting inputs (requirements.txt + pyproject.toml
 /// contents), sorted, so a plugin upgrade that changes them updates the venv.
-fn pip_fingerprint(result: &SyncResult) -> String {
-    let mut inputs: Vec<PathBuf> = result.requirements.clone();
-    for project in &result.projects {
+fn pip_fingerprint(requirements: &[PathBuf], projects: &[PathBuf]) -> String {
+    let mut inputs: Vec<PathBuf> = requirements.to_vec();
+    for project in projects {
         inputs.push(project.join("pyproject.toml"));
     }
     inputs.sort();
@@ -195,8 +227,34 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(
             result.lib_dirs,
-            vec![gem.join("lib"), gem.join("targets/A/lib"), gem.join("targets/B/lib")]
+            vec![
+                gem.join("lib"),
+                gem.join("targets/A/lib"),
+                gem.join("targets/B/lib")
+            ]
         );
         assert_eq!(result.requirements, vec![gem.join("requirements.txt")]);
+    }
+
+    #[test]
+    fn dependencies_are_limited_to_one_plugin() {
+        let root = PathBuf::from("/host_files");
+        let result = SyncResult {
+            lib_dirs: vec![root.join("a/lib"), root.join("b/lib")],
+            requirements: vec![
+                root.join("a/requirements.txt"),
+                root.join("b/requirements.txt"),
+            ],
+            projects: vec![root.join("b")],
+            pip_fingerprint: "all".to_string(),
+        };
+        let a = result.dependencies(Some("a"));
+        assert_eq!(a.requirements, vec![root.join("a/requirements.txt")]);
+        assert!(a.projects.is_empty());
+        // Other plugins' libs stay importable
+        assert_eq!(a.lib_dirs, result.lib_dirs);
+        let b = result.dependencies(Some("b"));
+        assert_eq!(b.projects, vec![root.join("b")]);
+        assert_eq!(result.dependencies(None).requirements.len(), 2);
     }
 }

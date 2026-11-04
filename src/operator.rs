@@ -69,8 +69,13 @@ pub struct MicroserviceConfig {
     pub python_packages: Vec<String>,
     /// `requirements.txt` files to install into the venv (plugin deps).
     pub pip_requirements: Vec<String>,
-    /// Directories containing a `pyproject.toml` to install into the venv.
+    /// Directories containing a `pyproject.toml` whose dependencies are
+    /// installed into the venv (the project itself is not built).
     pub pip_projects: Vec<String>,
+    /// The synced plugin files directory (under `host_files/`) whose Python
+    /// dependencies this microservice needs. `None` installs every plugin's
+    /// (COSMOS versions that don't say which plugin a microservice is from).
+    pub plugin_files: Option<String>,
     /// Hash of the venv-affecting inputs. A change (e.g. plugin upgrade) makes
     /// this config differ (triggering a respawn) and drives venv re-install.
     pub pip_fingerprint: String,
@@ -103,6 +108,7 @@ impl Default for MicroserviceConfig {
             python_packages: Vec::new(),
             pip_requirements: Vec::new(),
             pip_projects: Vec::new(),
+            plugin_files: None,
             pip_fingerprint: String::new(),
             stream: None,
             env: BTreeMap::new(),
@@ -254,8 +260,10 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
         for req in &config.pip_requirements {
             install.arg("-r").arg(req);
         }
+        // A plugin gem isn't a Python package, so install only the
+        // dependencies its pyproject.toml lists (which uv reads with -r)
         for project in &config.pip_projects {
-            install.arg(project);
+            install.arg("-r").arg(std::path::Path::new(project).join("pyproject.toml"));
         }
     };
     let has_installs = |packages: &[String]| {
@@ -1218,17 +1226,17 @@ impl MicroserviceOperator {
                 let pythonpath = std::env::join_paths(&sync.lib_dirs)
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
-                let requirements: Vec<String> =
-                    sync.requirements.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-                let projects: Vec<String> =
-                    sync.projects.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                 for config in configs.values_mut() {
                     if let Some(pp) = &pythonpath {
                         config.env.insert("PYTHONPATH".to_string(), pp.clone());
                     }
-                    config.pip_requirements = requirements.clone();
-                    config.pip_projects = projects.clone();
-                    config.pip_fingerprint = sync.pip_fingerprint.clone();
+                    // Only the microservice's own plugin's dependencies
+                    let deps = sync.dependencies(config.plugin_files.as_deref());
+                    config.pip_requirements =
+                        deps.requirements.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    config.pip_projects =
+                        deps.projects.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    config.pip_fingerprint = deps.pip_fingerprint;
                 }
             }
             configs
@@ -1665,6 +1673,7 @@ fn host_specs_to_configs(specs: Vec<HostSpec>) -> ConfigMap {
             ],
             env,
             needs_dependencies: spec.needs_dependencies,
+            plugin_files: spec.plugin_files.clone(),
             ..Default::default()
         };
         map.insert(spec.name.clone(), config);
