@@ -1606,8 +1606,9 @@ pub const HOST_PYTHON_PACKAGES: &[&str] = &["iroh", "openc3"];
 /// Python packages for the discovery venv: `openc3` (which provides the
 /// discovery runner and built-in discovery classes, and depends on pyserial)
 /// plus `hidapi`, `zeroconf` and `bleak` for the HID, mDNS and Bluetooth
-/// discovery classes in `openc3/discovery/`.
-pub const DISCOVERY_PYTHON_PACKAGES: &[&str] = &["openc3", "hidapi", "zeroconf", "bleak"];
+/// discovery classes in `openc3/discovery/`, and `pyusb` with
+/// `libusb-package` (which bundles libusb) for USB discovery.
+pub const DISCOVERY_PYTHON_PACKAGES: &[&str] = &["openc3", "hidapi", "zeroconf", "bleak", "pyusb", "libusb-package"];
 
 /// The config used to provision the shared discovery venv.
 fn discovery_venv_config() -> MicroserviceConfig {
