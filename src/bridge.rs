@@ -18,6 +18,7 @@
 //! * `api/host_microservices` — poll the list of host microservices to spawn.
 //! * `api/log` — forward host microservice stdout up so COSMOS logs it too.
 //! * `api/discovery` / `api/discovery_result` — long-poll for discovery requests
+//!   (and hardware scans, run with `openc3.discovery.discovery_scan`)
 //!   (e.g. "which serial ports exist?"), run them on this host with the Python
 //!   `openc3.discovery` runner, and return the results.
 //!
@@ -65,6 +66,12 @@ const DISCOVERY_RUN_TIMEOUT: Duration = Duration::from_secs(12);
 const DISCOVERY_RETRY: Duration = Duration::from_secs(5);
 /// Python module that runs a Discovery class and prints its results as JSON.
 const DISCOVERY_RUNNER_MODULE: &str = "openc3.discovery.discovery_runner";
+/// Python module that scans the host for hardware, reading the request as JSON
+/// on stdin and printing the devices found as JSON.
+const DISCOVERY_SCAN_MODULE: &str = "openc3.discovery.discovery_scan";
+/// Upper bound on one hardware scan. Each kind of device is scanned in
+/// parallel (Bluetooth takes ~5s and mDNS ~6s) and COSMOS waits 40s.
+const DISCOVERY_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on a small API response we will read.
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 /// Upper bound on one `api/interface_status` round trip. The operator polls it
@@ -219,11 +226,15 @@ pub struct InterfaceStatus {
 }
 
 /// A discovery request from COSMOS: the Python discovery class filename
-/// followed by its parameters, e.g. `["openc3/discovery/serial_discovery.py"]`.
+/// followed by its parameters, e.g. `["openc3/discovery/serial_discovery.py"]`,
+/// or a hardware scan with the matchers to check (see discovery_scan.py).
 #[derive(Debug, Deserialize)]
 pub struct DiscoveryRequest {
     pub id: String,
+    #[serde(default)]
     pub discovery: Vec<String>,
+    #[serde(default)]
+    pub scan: Option<serde_json::Value>,
 }
 
 /// How to run Python discovery on this host: the interpreter of a venv with
@@ -428,8 +439,11 @@ async fn discovery_worker(endpoint: Endpoint, addr: EndpointAddr, runner: Discov
             let addr = addr.clone();
             let current = runner.lock().ok().and_then(|runner| runner.clone());
             tokio::spawn(async move {
-                let result = run_discovery(current, &request.discovery).await;
-                if let Err(error) = post_discovery_result(&endpoint, &addr, &request.id, result).await {
+                let (key, result) = match &request.scan {
+                    Some(scan) => ("scan", run_scan(current, scan).await),
+                    None => ("results", run_discovery(current, &request.discovery).await),
+                };
+                if let Err(error) = post_discovery_result(&endpoint, &addr, &request.id, key, result).await {
                     crate::logging::warn("bridge", &format!("Failed to return discovery result: {error}"));
                 }
             });
@@ -458,15 +472,17 @@ async fn poll_discovery(endpoint: &Endpoint, addr: &EndpointAddr) -> Result<Vec<
     serde_json::from_slice(&data).context("parsing discovery response")
 }
 
-/// Send one discovery result (`results` list or `error`) back to the hub.
+/// Send one discovery result back to the hub: the value under `key`
+/// (`results` for a discovery, `scan` for a hardware scan) or an `error`.
 async fn post_discovery_result(
     endpoint: &Endpoint,
     addr: &EndpointAddr,
     id: &str,
+    key: &str,
     result: Result<serde_json::Value, String>,
 ) -> Result<()> {
     let request = match result {
-        Ok(results) => serde_json::json!({ "id": id, "results": results }),
+        Ok(value) => serde_json::json!({ "id": id, key: value }),
         Err(error) => serde_json::json!({ "id": id, "error": error }),
     };
     let conn = endpoint
@@ -518,24 +534,83 @@ async fn run_discovery(
     parse_discovery_output(&output.stdout, &output.stderr)
 }
 
-/// Interpret the runner's stdout (`{"results": [...]}` or `{"error": "..."}`).
-fn parse_discovery_output(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
-    let parsed: Option<serde_json::Value> = String::from_utf8_lossy(stdout)
+/// Run `python -m openc3.discovery.discovery_scan` with the scan request on
+/// stdin and return its response (`{"devices", "errors", "skipped"}`), or a
+/// short error for COSMOS to show.
+async fn run_scan(runner: Option<DiscoveryRunner>, scan: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let Some(runner) = runner else {
+        return Err("discovery is not ready on the host yet (its Python environment is still being set up)".to_string());
+    };
+    let mut cmd = std::process::Command::new(&runner.python);
+    cmd.arg("-m")
+        .arg(DISCOVERY_SCAN_MODULE)
+        .envs(&runner.env)
+        .current_dir(&runner.work_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::process::no_window(&mut cmd);
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let run = async {
+        let mut child = cmd.spawn().map_err(|error| format!("failed to run hardware scan: {error}"))?;
+        // The matchers go on stdin since they can exceed command line limits
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(scan.to_string().as_bytes())
+                .await
+                .map_err(|error| format!("failed to send the hardware scan request: {error}"))?;
+        }
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| format!("failed to run hardware scan: {error}"))
+    };
+    let output = match tokio::time::timeout(DISCOVERY_SCAN_TIMEOUT, run).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err(format!("hardware scan timed out after {}s", DISCOVERY_SCAN_TIMEOUT.as_secs())),
+    };
+    parse_scan_output(&output.stdout, &output.stderr)
+}
+
+/// Interpret the scan's stdout (`{"devices", ...}` or `{"error": "..."}`).
+fn parse_scan_output(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+    match last_json_line(stdout) {
+        Some(value) if value.get("devices").is_some() => Ok(value),
+        Some(value) if value.get("error").is_some() => {
+            Err(value["error"].as_str().unwrap_or("hardware scan failed").to_string())
+        }
+        _ => Err(format!("hardware scan failed: {}", last_line(stderr))),
+    }
+}
+
+/// The last non-empty line of a process's output, parsed as JSON.
+fn last_json_line(stdout: &[u8]) -> Option<serde_json::Value> {
+    String::from_utf8_lossy(stdout)
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
-        .and_then(|line| serde_json::from_str(line).ok());
-    match parsed {
+        .and_then(|line| serde_json::from_str(line).ok())
+}
+
+/// The last non-empty line of stderr, which explains a failure to start.
+fn last_line(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output").to_string()
+}
+
+/// Interpret the runner's stdout (`{"results": [...]}` or `{"error": "..."}`).
+fn parse_discovery_output(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+    match last_json_line(stdout) {
         Some(value) if value.get("results").is_some() => Ok(value["results"].clone()),
         Some(value) if value.get("error").is_some() => {
             Err(value["error"].as_str().unwrap_or("discovery failed").to_string())
         }
         // No JSON at all, e.g. Python failed to start or openc3 isn't installed
-        _ => {
-            let stderr = String::from_utf8_lossy(stderr);
-            let last = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output");
-            Err(format!("discovery failed: {last}"))
-        }
+        _ => Err(format!("discovery failed: {}", last_line(stderr))),
     }
 }
 
@@ -567,6 +642,36 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "discovery failed: ModuleNotFoundError: No module named 'openc3'");
+    }
+
+    #[test]
+    fn parses_scan_output() {
+        let scan = parse_scan_output(
+            b"{\"devices\": [{\"value\": \"abc\", \"matches\": [\"1\"]}], \"errors\": {}, \"skipped\": {}}\n",
+            b"",
+        )
+        .unwrap();
+        assert_eq!(scan["devices"][0]["matches"], serde_json::json!(["1"]));
+        let error = parse_scan_output(b"{\"error\": \"JSONDecodeError: bad\"}\n", b"").unwrap_err();
+        assert_eq!(error, "JSONDecodeError: bad");
+        let error = parse_scan_output(b"", b"No module named openc3.discovery.discovery_scan\n").unwrap_err();
+        assert_eq!(error, "hardware scan failed: No module named openc3.discovery.discovery_scan");
+    }
+
+    #[test]
+    fn discovery_requests_may_be_scans() {
+        let request: DiscoveryRequest =
+            serde_json::from_str(r#"{"id": "1", "discovery": [], "scan": {"matchers": []}}"#).unwrap();
+        assert_eq!(request.scan, Some(serde_json::json!({ "matchers": [] })));
+        let request: DiscoveryRequest = serde_json::from_str(r#"{"id": "2", "discovery": ["x.py"]}"#).unwrap();
+        assert!(request.scan.is_none());
+    }
+
+    #[test]
+    fn scan_not_ready_without_runner() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(run_scan(None, &serde_json::json!({}))).unwrap_err();
+        assert!(error.contains("not ready"));
     }
 
     #[test]
