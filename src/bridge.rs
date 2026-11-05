@@ -207,6 +207,15 @@ pub struct HostSpec {
     /// Python dependencies are installed for this microservice.
     #[serde(default)]
     pub plugin_files: Option<String>,
+    /// The plugin install's own requirements file in `plugin_files` (e.g.
+    /// `requirements__1.txt`), since installs of one gem can need different
+    /// packages. Older COSMOS versions don't send it.
+    #[serde(default)]
+    pub plugin_requirements: Option<String>,
+    /// The directory of the plugin install's own `pyproject.toml` in
+    /// `plugin_files` (e.g. `installs/1`).
+    #[serde(default)]
+    pub plugin_project: Option<String>,
 }
 
 /// A host interface's status, as reported over the control channel and tapped by

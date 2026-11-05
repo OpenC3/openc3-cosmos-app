@@ -68,8 +68,11 @@ pub fn sync(client: &BridgeClient, host_files_dir: &Path) -> Result<SyncResult> 
 
 impl SyncResult {
     /// The Python dependency inputs of one plugin's synced files directory
-    /// (all plugins' when `None`), with their own fingerprint.
-    pub fn dependencies(&self, plugin_files: Option<&str>) -> SyncResult {
+    /// (all plugins' when `None`), with their own fingerprint. Installs of the
+    /// same gem can need different packages, so `install` names the
+    /// microservice's plugin install's own files in that directory, used in
+    /// place of the gem's when they exist.
+    pub fn dependencies(&self, plugin_files: Option<&str>, install: &PluginInstall) -> SyncResult {
         let Some(plugin_files) = plugin_files else {
             return self.clone();
         };
@@ -77,17 +80,30 @@ impl SyncResult {
             dir.and_then(|d| d.file_name())
                 .is_some_and(|name| name == plugin_files)
         };
+        // Relative paths only, so they can't point outside the plugin's directory
+        let install_file = install.requirements.as_deref().filter(|name| is_relative_path(name, false));
+        let install_project = install.project.as_deref().filter(|dir| is_relative_path(dir, true));
         let requirements: Vec<PathBuf> = self
             .requirements
             .iter()
             .filter(|path| in_plugin(path.parent()))
-            .cloned()
+            .map(|path| {
+                install_file
+                    .map(|name| path.with_file_name(name))
+                    .filter(|install| install.is_file())
+                    .unwrap_or_else(|| path.clone())
+            })
             .collect();
         let projects: Vec<PathBuf> = self
             .projects
             .iter()
             .filter(|dir| in_plugin(Some(dir)))
-            .cloned()
+            .map(|dir| {
+                install_project
+                    .map(|rel| resolve(dir, rel))
+                    .filter(|install| install.join("pyproject.toml").is_file())
+                    .unwrap_or_else(|| dir.clone())
+            })
             .collect();
         SyncResult {
             lib_dirs: self.lib_dirs.clone(),
@@ -95,6 +111,28 @@ impl SyncResult {
             requirements,
             projects,
         }
+    }
+}
+
+/// A plugin install's own Python dependency files in its plugin's synced files
+/// directory (sent by COSMOS versions that sync them per install).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PluginInstall {
+    /// Its requirements file, e.g. `requirements__1.txt`.
+    pub requirements: Option<String>,
+    /// The directory of its `pyproject.toml`, e.g. `installs/1`.
+    pub project: Option<String>,
+}
+
+/// Whether `path` is a `/`-separated relative path of plain names (a single
+/// file name unless `nested`).
+fn is_relative_path(path: &str, nested: bool) -> bool {
+    let mut parts = path.split('/');
+    let valid = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']);
+    if nested {
+        parts.all(valid)
+    } else {
+        parts.next().is_some_and(valid) && parts.next().is_none()
     }
 }
 
@@ -248,13 +286,56 @@ mod tests {
             projects: vec![root.join("b")],
             pip_fingerprint: "all".to_string(),
         };
-        let a = result.dependencies(Some("a"));
+        let a = result.dependencies(Some("a"), &PluginInstall::default());
         assert_eq!(a.requirements, vec![root.join("a/requirements.txt")]);
         assert!(a.projects.is_empty());
         // Other plugins' libs stay importable
         assert_eq!(a.lib_dirs, result.lib_dirs);
-        let b = result.dependencies(Some("b"));
+        let b = result.dependencies(Some("b"), &PluginInstall::default());
         assert_eq!(b.projects, vec![root.join("b")]);
-        assert_eq!(result.dependencies(None).requirements.len(), 2);
+        assert_eq!(result.dependencies(None, &PluginInstall::default()).requirements.len(), 2);
+    }
+
+    #[test]
+    fn dependencies_use_the_install_files() {
+        let root = std::env::temp_dir().join(format!("openc3_hostfiles_install_{}", std::process::id()));
+        let gem = root.join("plugin-1.0.0");
+        std::fs::create_dir_all(gem.join("installs/1")).unwrap();
+        std::fs::write(gem.join("requirements.txt"), "wled\n").unwrap();
+        std::fs::write(gem.join("requirements__1.txt"), "govee\n").unwrap();
+        std::fs::write(gem.join("pyproject.toml"), "wled").unwrap();
+        std::fs::write(gem.join("installs/1/pyproject.toml"), "govee").unwrap();
+        let result = scan(&root);
+        let install = |requirements: &str, project: &str| PluginInstall {
+            requirements: Some(requirements.to_string()),
+            project: Some(project.to_string()),
+        };
+        let deps = result.dependencies(Some("plugin-1.0.0"), &install("requirements__1.txt", "installs/1"));
+        assert_eq!(deps.requirements, vec![gem.join("requirements__1.txt")]);
+        assert_eq!(deps.projects, vec![gem.join("installs").join("1")]);
+        // Files that weren't synced fall back to the gem's
+        let first = result.dependencies(Some("plugin-1.0.0"), &install("requirements__0.txt", "installs/0"));
+        assert_eq!(first.requirements, vec![gem.join("requirements.txt")]);
+        assert_eq!(first.projects, vec![gem.clone()]);
+        // Each install's files give it its own fingerprint
+        assert_ne!(deps.pip_fingerprint, first.pip_fingerprint);
+        // Only paths in the plugin's directory are used
+        let escape = result.dependencies(
+            Some("plugin-1.0.0"),
+            &install("../plugin-1.0.0/requirements__1.txt", "../plugin-1.0.0/installs/1"),
+        );
+        assert_eq!(escape.requirements, vec![gem.join("requirements.txt")]);
+        assert_eq!(escape.projects, vec![gem.clone()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn relative_paths_are_plain_names() {
+        assert!(is_relative_path("requirements__1.txt", false));
+        assert!(!is_relative_path("installs/1", false));
+        assert!(is_relative_path("installs/1", true));
+        for path in ["", "..", "a/../b", "/abs", "a//b", "a\\b", "C:x"] {
+            assert!(!is_relative_path(path, true), "{path}");
+        }
     }
 }

@@ -76,6 +76,9 @@ pub struct MicroserviceConfig {
     /// dependencies this microservice needs. `None` installs every plugin's
     /// (COSMOS versions that don't say which plugin a microservice is from).
     pub plugin_files: Option<String>,
+    /// The microservice's plugin install's own dependency files in
+    /// `plugin_files`, used instead of the gem's.
+    pub plugin_install: crate::hostfiles::PluginInstall,
     /// Hash of the venv-affecting inputs. A change (e.g. plugin upgrade) makes
     /// this config differ (triggering a respawn) and drives venv re-install.
     pub pip_fingerprint: String,
@@ -109,6 +112,7 @@ impl Default for MicroserviceConfig {
             pip_requirements: Vec::new(),
             pip_projects: Vec::new(),
             plugin_files: None,
+            plugin_install: Default::default(),
             pip_fingerprint: String::new(),
             stream: None,
             env: BTreeMap::new(),
@@ -1284,7 +1288,7 @@ impl MicroserviceOperator {
                         config.env.insert("PYTHONPATH".to_string(), pp.clone());
                     }
                     // Only the microservice's own plugin's dependencies
-                    let deps = sync.dependencies(config.plugin_files.as_deref());
+                    let deps = sync.dependencies(config.plugin_files.as_deref(), &config.plugin_install);
                     config.pip_requirements =
                         deps.requirements.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                     config.pip_projects =
@@ -1728,6 +1732,10 @@ fn host_specs_to_configs(specs: Vec<HostSpec>) -> ConfigMap {
             env,
             needs_dependencies: spec.needs_dependencies,
             plugin_files: spec.plugin_files.clone(),
+            plugin_install: crate::hostfiles::PluginInstall {
+                requirements: spec.plugin_requirements.clone(),
+                project: spec.plugin_project.clone(),
+            },
             ..Default::default()
         };
         map.insert(spec.name.clone(), config);
