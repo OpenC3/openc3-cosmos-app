@@ -60,6 +60,9 @@ pub fn sync(client: &BridgeClient, host_files_dir: &Path) -> Result<SyncResult> 
     for path in &delta.deletions {
         let _ = std::fs::remove_file(resolve(host_files_dir, path));
     }
+    // Remove the directories the deletions emptied (e.g. a plugin version that
+    // was uninstalled or upgraded), so their lib dirs leave PYTHONPATH
+    remove_empty_dirs(host_files_dir);
 
     let mut result = scan(host_files_dir);
     result.pip_fingerprint = pip_fingerprint(&result.requirements, &result.projects);
@@ -105,8 +108,17 @@ impl SyncResult {
                     .unwrap_or_else(|| dir.clone())
             })
             .collect();
+        // The plugin's own libs come first on PYTHONPATH, so another version of
+        // the plugin (with the same module names) can't shadow them. Other
+        // plugins' libs stay importable after them.
+        let (mut lib_dirs, others): (Vec<PathBuf>, Vec<PathBuf>) = self
+            .lib_dirs
+            .iter()
+            .cloned()
+            .partition(|lib| lib.ancestors().any(|dir| dir.file_name().is_some_and(|name| name == plugin_files)));
+        lib_dirs.extend(others);
         SyncResult {
-            lib_dirs: self.lib_dirs.clone(),
+            lib_dirs,
             pip_fingerprint: pip_fingerprint(&requirements, &projects),
             requirements,
             projects,
@@ -169,6 +181,25 @@ fn resolve(base: &Path, rel: &str) -> PathBuf {
     path
 }
 
+/// Remove the empty directories under `dir` (not `dir` itself). Returns
+/// whether `dir` is left empty.
+fn remove_empty_dirs(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut empty = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Not following symlinks, which the sync never creates
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_dir && remove_empty_dirs(&path) && std::fs::remove_dir(&path).is_ok() {
+            continue;
+        }
+        empty = false;
+    }
+    empty
+}
+
 /// Build the current on-disk manifest: `<relative/path> -> sha256 hex`.
 fn current_manifest(dir: &Path) -> Result<BTreeMap<String, String>> {
     let mut manifest = BTreeMap::new();
@@ -220,8 +251,10 @@ fn scan(host_files_dir: &Path) -> SyncResult {
         Ok(e) => e,
         Err(_) => return result,
     };
-    for gem in gem_dirs.flatten() {
-        let gem_path = gem.path();
+    // Sorted so PYTHONPATH has a stable order rather than the filesystem's
+    let mut gem_paths: Vec<PathBuf> = gem_dirs.flatten().map(|gem| gem.path()).collect();
+    gem_paths.sort();
+    for gem_path in gem_paths {
         if !gem_path.is_dir() {
             continue;
         }
@@ -289,8 +322,10 @@ mod tests {
         let a = result.dependencies(Some("a"), &PluginInstall::default());
         assert_eq!(a.requirements, vec![root.join("a/requirements.txt")]);
         assert!(a.projects.is_empty());
-        // Other plugins' libs stay importable
+        // Other plugins' libs stay importable, after the plugin's own
         assert_eq!(a.lib_dirs, result.lib_dirs);
+        let b_libs = result.dependencies(Some("b"), &PluginInstall::default()).lib_dirs;
+        assert_eq!(b_libs, vec![root.join("b/lib"), root.join("a/lib")]);
         let b = result.dependencies(Some("b"), &PluginInstall::default());
         assert_eq!(b.projects, vec![root.join("b")]);
         assert_eq!(result.dependencies(None, &PluginInstall::default()).requirements.len(), 2);
@@ -326,6 +361,47 @@ mod tests {
         );
         assert_eq!(escape.requirements, vec![gem.join("requirements.txt")]);
         assert_eq!(escape.projects, vec![gem.clone()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_plugins_own_libs_come_before_other_versions() {
+        let root = PathBuf::from("/host_files");
+        let result = SyncResult {
+            lib_dirs: vec![
+                root.join("ha-3.0.0/targets/HA/lib"),
+                root.join("demo-1.0.0/lib"),
+                root.join("ha-4.0.0/lib"),
+                root.join("ha-4.0.0/targets/HA/lib"),
+            ],
+            ..SyncResult::default()
+        };
+        let deps = result.dependencies(Some("ha-4.0.0"), &PluginInstall::default());
+        assert_eq!(
+            deps.lib_dirs,
+            vec![
+                root.join("ha-4.0.0/lib"),
+                root.join("ha-4.0.0/targets/HA/lib"),
+                root.join("ha-3.0.0/targets/HA/lib"),
+                root.join("demo-1.0.0/lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_dirs_are_removed() {
+        let root = std::env::temp_dir().join(format!("openc3_hostfiles_empty_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("old-1.0.0/targets/HA/lib/ha")).unwrap();
+        std::fs::create_dir_all(root.join("new-2.0.0/lib/pkg/empty")).unwrap();
+        std::fs::write(root.join("new-2.0.0/lib/pkg/module.py"), "").unwrap();
+        assert!(!remove_empty_dirs(&root));
+        assert!(!root.join("old-1.0.0").exists());
+        assert!(!root.join("new-2.0.0/lib/pkg/empty").exists());
+        assert!(root.join("new-2.0.0/lib/pkg/module.py").is_file());
+        // The synced files directory itself is kept
+        std::fs::remove_dir_all(root.join("new-2.0.0")).unwrap();
+        assert!(remove_empty_dirs(&root));
+        assert!(root.is_dir());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

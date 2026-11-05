@@ -1280,15 +1280,13 @@ impl MicroserviceOperator {
             self.synced_host_configs = hub_configs.clone();
             let mut configs = hub_configs;
             if let Some(sync) = &self.last_sync {
-                let pythonpath = std::env::join_paths(&sync.lib_dirs)
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned());
                 for config in configs.values_mut() {
-                    if let Some(pp) = &pythonpath {
-                        config.env.insert("PYTHONPATH".to_string(), pp.clone());
-                    }
-                    // Only the microservice's own plugin's dependencies
+                    // Only the microservice's own plugin's dependencies, and its
+                    // libs first on PYTHONPATH
                     let deps = sync.dependencies(config.plugin_files.as_deref(), &config.plugin_install);
+                    if let Ok(pythonpath) = std::env::join_paths(&deps.lib_dirs) {
+                        config.env.insert("PYTHONPATH".to_string(), pythonpath.to_string_lossy().into_owned());
+                    }
                     config.pip_requirements =
                         deps.requirements.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                     config.pip_projects =
