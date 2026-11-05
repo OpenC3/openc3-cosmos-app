@@ -45,6 +45,14 @@ pub struct LogRecord {
     pub message: String,
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+impl LogRecord {
+    /// The record as one line of text, as copied from the log table.
+    pub fn to_line(&self) -> String {
+        format!("{} {} {}: {}", self.timestamp, self.level, self.source, self.message)
+    }
+}
+
 fn sink() -> &'static Mutex<VecDeque<LogRecord>> {
     static SINK: OnceLock<Mutex<VecDeque<LogRecord>>> = OnceLock::new();
     SINK.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECORDS)))
@@ -217,4 +225,20 @@ pub fn error(name: &str, message: &str) {
 #[allow(dead_code)]
 pub fn debug(name: &str, message: &str) {
     emit("DEBUG", Some(name), message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_record_as_a_line() {
+        let record = LogRecord {
+            timestamp: "2026-11-05T04:46:19.169844Z".to_string(),
+            level: "ERROR".to_string(),
+            source: "DUAL_SENSE_INT".to_string(),
+            message: "bridge error: Not Found".to_string(),
+        };
+        assert_eq!(record.to_line(), "2026-11-05T04:46:19.169844Z ERROR DUAL_SENSE_INT: bridge error: Not Found");
+    }
 }

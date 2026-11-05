@@ -16,6 +16,7 @@
 
 use super::app_state::{level_rank, AppState, LogLevelFilter, Page};
 use super::ui::{self, color};
+use crate::logging::LogRecord;
 use crate::monitor::{self, ContainerStatus, RunState};
 use crate::settings::{Edition, DEFAULT_COSMOS_URL};
 use gpui_kit::assets::IconName;
@@ -39,6 +40,28 @@ const LOGO_PNG: &[u8] = include_bytes!("../../assets/icons/512x512.png");
 
 /// Maximum rows rendered in the log table (newest first).
 const MAX_LOG_ROWS: usize = 300;
+
+/// The log records the log table shows, newest first with their index:
+/// level >= the selected minimum and matching the search, capped so a huge
+/// backlog doesn't bloat a frame.
+fn shown_log_records(s: &AppState) -> impl DoubleEndedIterator<Item = (usize, &LogRecord)> + '_ {
+    let min_rank = s.log_level.rank();
+    let needle = s.log_search.to_lowercase();
+    let shown: Vec<(usize, &LogRecord)> = s
+        .log_records
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, rec)| level_rank(&rec.level) >= min_rank)
+        .filter(|(_, rec)| {
+            needle.is_empty()
+                || rec.message.to_lowercase().contains(&needle)
+                || rec.source.to_lowercase().contains(&needle)
+        })
+        .take(MAX_LOG_ROWS)
+        .collect();
+    shown.into_iter()
+}
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
@@ -202,6 +225,15 @@ impl MainView {
                 let (label, tint) = cosmos_state(s);
                 right = right.child(ui::pill(label, tint));
             }
+            right = right.child(
+                Button::new("open-setup")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Wrench)
+                    .tooltip("Setup")
+                    .disabled(s.busy())
+                    .on_click(self.act(|s, cx| s.open_setup(cx))),
+            );
             right = right.child(
                 Button::new("open-settings")
                     .ghost()
@@ -492,7 +524,8 @@ impl MainView {
                 h_flex().justify_center().child(
                     Button::new("skip-setup")
                         .ghost()
-                        .label("Skip for now")
+                        .when(s.revisiting_setup, |button| button.icon(IconName::ArrowLeft))
+                        .label(if s.revisiting_setup { "Back to dashboard" } else { "Skip for now" })
                         .on_click(self.act(|s, cx| s.skip_setup(cx))),
                 ),
             );
@@ -507,7 +540,11 @@ impl MainView {
 
     /// The main dashboard.
     fn dashboard(&self, s: &AppState, cx: &App) -> AnyElement {
-        let mut body = v_flex().gap_4().p_5().child(self.hero(s));
+        // At least the window's height, with the activity log filling what the
+        // other sections leave, so it scrolls inside itself rather than with
+        // the page. The page only scrolls when the window is too short for the
+        // log's minimum height.
+        let mut body = v_flex().min_h_full().gap_4().p_5().child(self.hero(s));
         body = body.child(self.stats(s));
         if s.settings.run_locally {
             body = body.child(self.containers(s, cx));
@@ -864,6 +901,19 @@ impl MainView {
                         .prefix(Icon::new(IconName::Search).xsmall().text_color(color::muted())),
                 ),
             )
+            .child({
+                let key = "all".to_string();
+                let copied = s.log_copied.as_deref() == Some(key.as_str());
+                Button::new("copy-log")
+                    .small()
+                    .ghost()
+                    .icon(if copied { IconName::CopyCheck } else { IconName::Copy })
+                    .tooltip("Copy the messages shown")
+                    .on_click(self.act(move |s, cx| {
+                        let text = shown_log_records(s).rev().map(|(_, rec)| rec.to_line()).collect::<Vec<_>>().join("\n");
+                        s.copy_log(key.clone(), text, cx)
+                    }))
+            })
             .child(
                 Button::new("pause-log")
                     .small()
@@ -881,26 +931,22 @@ impl MainView {
                     .on_click(self.act(|s, cx| s.clear_log(cx))),
             );
 
-        // Filter to level >= the selected minimum and matching the search, then
-        // show newest first (capped so a huge backlog doesn't bloat a frame).
-        let min_rank = s.log_level.rank();
-        let needle = s.log_search.to_lowercase();
         let mono = ui::mono(cx);
-        let rows: Vec<AnyElement> = s
-            .log_records
-            .iter()
-            .rev()
-            .filter(|rec| level_rank(&rec.level) >= min_rank)
-            .filter(|rec| {
-                needle.is_empty()
-                    || rec.message.to_lowercase().contains(&needle)
-                    || rec.source.to_lowercase().contains(&needle)
-            })
-            .take(MAX_LOG_ROWS)
-            .map(|rec| {
+        let rows: Vec<AnyElement> = shown_log_records(s)
+            .map(|(index, rec)| {
                 // "2026-07-19T20:37:33.129001Z" -> "20:37:33.129"
                 let time = rec.timestamp.get(11..23).unwrap_or(rec.timestamp.as_str()).to_string();
+                let key = format!("{index}:{}", rec.timestamp);
+                let copied = s.log_copied.as_deref() == Some(key.as_str());
+                let line = rec.to_line();
+                let copy = Button::new(SharedString::from(format!("copy-log-{index}")))
+                    .xsmall()
+                    .ghost()
+                    .icon(if copied { IconName::CopyCheck } else { IconName::Copy })
+                    .tooltip("Copy")
+                    .on_click(self.act(move |s, cx| s.copy_log(key.clone(), line.clone(), cx)));
                 h_flex()
+                    .group("log-row")
                     .gap_3()
                     .items_start()
                     .px_3()
@@ -924,14 +970,22 @@ impl MainView {
                             .child(rec.source.clone()),
                     )
                     .child(div().flex_1().min_w_0().child(rec.message.clone()))
+                    // Shown on hover, or while it shows the row was copied
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .when(!copied, |button| button.invisible().group_hover("log-row", |button| button.visible()))
+                            .child(copy),
+                    )
                     .into_any_element()
             })
             .collect();
         let empty = rows.is_empty();
 
-        ui::card().child(header).child(
+        ui::card().flex_1().min_h(px(260.)).child(header).child(
             div()
-                .h(px(320.))
+                .flex_1()
+                .min_h_0()
                 .rounded(px(10.))
                 .border_1()
                 .border_color(color::border())

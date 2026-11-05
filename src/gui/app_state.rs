@@ -27,7 +27,7 @@ use crate::operator::{BridgeConnectionStatus, MicroserviceOperator, Microservice
 use crate::settings::{Edition, Settings};
 use crate::update::{CheckOutcome, CosmosRelease, Release};
 use crate::{commands, install};
-use gpui_kit::{AnyWindowHandle, Context as Cx, Entity, SharedString};
+use gpui_kit::{AnyWindowHandle, ClipboardItem, Context as Cx, Entity, SharedString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -258,11 +258,16 @@ pub struct AppState {
     pub log_level: LogLevelFilter,
     pub log_search: String,
     pub log_paused: bool,
+    /// The log copy button that last copied, shown as copied for a moment.
+    pub log_copied: Option<String>,
 
     /// The long-running action in progress, if any (the app is "busy").
     pub task: Option<RunningTask>,
 
     pub settings_open: bool,
+    /// The setup page was opened from the dashboard, so it stays open until
+    /// left rather than advancing once nothing is missing.
+    pub revisiting_setup: bool,
     /// The effective Development-mode context — `(run folder, core folder)` —
     /// captured when Settings opened; if it differs on close the operator is
     /// restarted so the bridge re-enrolls against the new compose context.
@@ -381,8 +386,10 @@ impl AppState {
             log_level: LogLevelFilter::Info,
             log_search: String::new(),
             log_paused: false,
+            log_copied: None,
             task: None,
             settings_open: false,
+            revisiting_setup: false,
             dev_context_on_open: (None, None),
             shutdown_confirm: false,
             quit_confirm: false,
@@ -600,7 +607,7 @@ impl AppState {
         }
         self.installed_cosmos = env.installed_cosmos.clone();
         self.env = Some(env);
-        if self.page == Page::Install && !self.busy() && !self.needs_setup() {
+        if self.page == Page::Install && !self.revisiting_setup && !self.busy() && !self.needs_setup() {
             self.go_main(cx);
         }
     }
@@ -792,7 +799,21 @@ impl AppState {
     }
 
     /// Leave the setup page without installing everything.
+    /// Show the setup page again from the dashboard, e.g. to switch edition or
+    /// reinstall a component.
+    pub fn open_setup(&mut self, cx: &mut Cx<Self>) {
+        if self.busy() || self.env.is_none() {
+            return;
+        }
+        self.settings_open = false;
+        self.revisiting_setup = true;
+        self.page = Page::Install;
+        self.refresh_env(cx);
+        cx.notify();
+    }
+
     pub fn skip_setup(&mut self, cx: &mut Cx<Self>) {
+        self.revisiting_setup = false;
         self.go_main(cx);
         self.refresh_env(cx);
         cx.notify();
@@ -1074,6 +1095,24 @@ impl AppState {
             self.log_generation = u64::MAX;
         }
         cx.notify();
+    }
+
+    /// Copy log text to the clipboard, marking the copy button `key` as
+    /// copied for a moment.
+    pub fn copy_log(&mut self, key: String, text: String, cx: &mut Cx<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.log_copied = Some(key.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.log_copied.as_deref() == Some(key.as_str()) {
+                    state.log_copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn clear_log(&mut self, cx: &mut Cx<Self>) {

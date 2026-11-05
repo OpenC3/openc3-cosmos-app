@@ -207,25 +207,34 @@ pub fn stat_tile(
     value: impl IntoElement,
     detail: impl Into<SharedString>,
 ) -> Div {
+    // One row (icon, label over value, detail) to keep the dashboard short
     card()
         .flex_1()
-        .min_w(px(160.))
-        .gap_2()
+        .min_w(px(200.))
+        .px_3()
+        .py_2p5()
         .child(
             h_flex()
-                .gap_2()
+                .gap_2p5()
                 .items_center()
                 .child(icon_badge(icon, tint))
                 .child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .child(div().text_xs().text_color(color::muted()).font_medium().child(label.into()))
+                        .child(div().text_base().font_semibold().child(value)),
+                )
+                .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_right()
                         .text_xs()
-                        .text_color(color::muted())
-                        .font_medium()
-                        .child(label.into()),
+                        .text_color(color::faint())
+                        .truncate()
+                        .child(detail.into()),
                 ),
         )
-        .child(div().text_xl().font_semibold().child(value))
-        .child(div().text_xs().text_color(color::faint()).truncate().child(detail.into()))
 }
 
 /// Muted helper text.
