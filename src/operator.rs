@@ -214,10 +214,13 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     let devel_openc3 = openc3_devel_source();
     // The devel source is part of what's installed, so fold it into the
     // fingerprint: toggling OPENC3_DEVEL (or changing its path) rebuilds the venv.
-    let fingerprint = match &devel_openc3 {
-        Some(src) => format!("{}|openc3-devel:{}", config.pip_fingerprint, src.display()),
-        None => config.pip_fingerprint.clone(),
-    };
+    let mut fingerprint = format!("python:{PYTHON_VERSION}|{}", config.pip_fingerprint);
+    if let Some(src) = &devel_openc3 {
+        fingerprint.push_str(&format!("|openc3-devel:{}", src.display()));
+    }
+    let cache = python_dir.join("cache");
+    let runtimes = python_dir.join("runtimes");
+    let uv = locate_uv(python_dir);
     // Skip when the venv is present AND its installed inputs match the current
     // fingerprint. When they differ (e.g. a plugin upgrade changed requirements),
     // rebuild the venv from scratch so removed dependencies are pruned. Callers
@@ -226,6 +229,26 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
         let current = std::fs::read_to_string(&fingerprint_file).unwrap_or_default();
         if current == fingerprint {
             return;
+        }
+        // Install the Python runtime before deleting the old venv, so a host
+        // that can't download it (e.g. offline after an app update changed
+        // PYTHON_VERSION) keeps running the venv it has.
+        if let Some(uv) = &uv {
+            let mut install = Command::new(uv);
+            install
+                .args(["python", "install", PYTHON_VERSION])
+                .env("UV_PYTHON_INSTALL_DIR", &runtimes)
+                .env("UV_CACHE_DIR", &cache);
+            if process::run(&mut install).is_err() {
+                log_error(
+                    "MicroserviceOperator",
+                    &format!(
+                        "failed to install Python {PYTHON_VERSION}; keeping the existing venv at {}",
+                        venv_dir.display()
+                    ),
+                );
+                return;
+            }
         }
         log_info(
             "MicroserviceOperator",
@@ -239,8 +262,6 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
             &format!("OPENC3_DEVEL: installing openc3 (editable) from {}", src.display()),
         );
     }
-    let cache = python_dir.join("cache");
-    let runtimes = python_dir.join("runtimes");
     // Add the configured packages to an install command, substituting an
     // editable install of the local openc3 source when in OPENC3_DEVEL mode.
     let add_packages = |install: &mut Command| {
@@ -273,14 +294,14 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     };
 
     let mut installed = true;
-    if let Some(uv) = locate_uv(python_dir) {
+    if let Some(uv) = uv {
         let mut create = Command::new(&uv);
         create
             // --clear replaces any existing (possibly partial or unrecognized)
             // venv without uv's interactive "already exists, replace? [y/n]"
             // prompt, which hangs the app when stdin is a TTY. Reaching here
             // means we intend a fresh venv anyway.
-            .args(["venv", "--clear", "--python", DEFAULT_PYTHON])
+            .args(["venv", "--clear", "--python", PYTHON_VERSION])
             .arg(venv_dir)
             .env("UV_PYTHON_INSTALL_DIR", &runtimes)
             .env("UV_CACHE_DIR", &cache);
@@ -337,8 +358,9 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     }
 }
 
-/// The default Python version for provisioned venvs.
-const DEFAULT_PYTHON: &str = "3.12";
+/// The Python version uv installs for the base venv and every host venv.
+/// Part of each venv's fingerprint, so changing it rebuilds existing venvs.
+pub const PYTHON_VERSION: &str = "3.13";
 
 // ---------------------------------------------------------------------------
 // Captured output (bounded ring of first N + last N lines)
