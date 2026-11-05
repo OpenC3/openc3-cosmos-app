@@ -680,7 +680,7 @@ pub fn python(ctx: &Context) -> Result<()> {
     notify(format!("Installing Python {PYTHON_VERSION} into {}", runtimes.display()));
     let mut install = Command::new(&uv);
     install
-        .args(["python", "install", PYTHON_VERSION])
+        .args(["python", "install", "--no-bin", PYTHON_VERSION])
         .env("UV_PYTHON_INSTALL_DIR", &install_dir)
         .env("UV_CACHE_DIR", &cache);
     process::run(&mut install)?;

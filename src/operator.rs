@@ -203,58 +203,37 @@ fn locate_uv(python_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Ensure a per-microservice venv exists at `venv_dir` and has `packages`
-/// installed. Best-effort: failures are logged and the (possibly incomplete)
-/// venv is still used. Prefers `uv`; falls back to the base interpreter's
-/// stdlib `venv` + `pip`.
+/// installed. Prefers `uv`; falls back to the base interpreter's stdlib `venv` +
+/// `pip`. A rebuild happens in a staging venv next to `venv_dir` that replaces
+/// the existing venv only once its install succeeds, so a failed rebuild (e.g.
+/// offline, or a package that can't build) keeps the working venv. Without an
+/// existing venv the (possibly incomplete) staged venv is used anyway, and the
+/// install is retried on the next start.
 fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) {
-    let interpreter = venv_interpreter(venv_dir);
-    let fingerprint_file = venv_dir.join(".openc3_pip_fingerprint");
+    let fingerprint_name = ".openc3_pip_fingerprint";
     // In OPENC3_DEVEL mode, install openc3 editable from the local checkout so
     // host microservices run the working-tree source, not the published package.
     let devel_openc3 = openc3_devel_source();
-    // The devel source is part of what's installed, so fold it into the
-    // fingerprint: toggling OPENC3_DEVEL (or changing its path) rebuilds the venv.
+    // The Python version and devel source are part of what's installed, so fold
+    // them into the fingerprint: changing PYTHON_VERSION or toggling
+    // OPENC3_DEVEL (or changing its path) rebuilds the venv.
     let mut fingerprint = format!("python:{PYTHON_VERSION}|{}", config.pip_fingerprint);
     if let Some(src) = &devel_openc3 {
         fingerprint.push_str(&format!("|openc3-devel:{}", src.display()));
     }
-    let cache = python_dir.join("cache");
-    let runtimes = python_dir.join("runtimes");
-    let uv = locate_uv(python_dir);
     // Skip when the venv is present AND its installed inputs match the current
     // fingerprint. When they differ (e.g. a plugin upgrade changed requirements),
-    // rebuild the venv from scratch so removed dependencies are pruned. Callers
-    // ensure the process is stopped first, so deleting the venv is safe.
-    if interpreter.exists() {
-        let current = std::fs::read_to_string(&fingerprint_file).unwrap_or_default();
+    // rebuild the venv from scratch so removed dependencies are pruned.
+    let existing = venv_interpreter(venv_dir).exists();
+    if existing {
+        let current = std::fs::read_to_string(venv_dir.join(fingerprint_name)).unwrap_or_default();
         if current == fingerprint {
             return;
-        }
-        // Install the Python runtime before deleting the old venv, so a host
-        // that can't download it (e.g. offline after an app update changed
-        // PYTHON_VERSION) keeps running the venv it has.
-        if let Some(uv) = &uv {
-            let mut install = Command::new(uv);
-            install
-                .args(["python", "install", PYTHON_VERSION])
-                .env("UV_PYTHON_INSTALL_DIR", &runtimes)
-                .env("UV_CACHE_DIR", &cache);
-            if process::run(&mut install).is_err() {
-                log_error(
-                    "MicroserviceOperator",
-                    &format!(
-                        "failed to install Python {PYTHON_VERSION}; keeping the existing venv at {}",
-                        venv_dir.display()
-                    ),
-                );
-                return;
-            }
         }
         log_info(
             "MicroserviceOperator",
             &format!("Rebuilding venv (dependencies changed) at {}", venv_dir.display()),
         );
-        let _ = std::fs::remove_dir_all(venv_dir);
     }
     if let Some(src) = &devel_openc3 {
         log_info(
@@ -262,6 +241,10 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
             &format!("OPENC3_DEVEL: installing openc3 (editable) from {}", src.display()),
         );
     }
+    let staging = sibling(venv_dir, "staging");
+    let interpreter = venv_interpreter(&staging);
+    let cache = python_dir.join("cache");
+    let runtimes = python_dir.join("runtimes");
     // Add the configured packages to an install command, substituting an
     // editable install of the local openc3 source when in OPENC3_DEVEL mode.
     let add_packages = |install: &mut Command| {
@@ -294,22 +277,21 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     };
 
     let mut installed = true;
-    if let Some(uv) = uv {
+    if let Some(uv) = locate_uv(python_dir) {
         let mut create = Command::new(&uv);
         create
-            // --clear replaces any existing (possibly partial or unrecognized)
-            // venv without uv's interactive "already exists, replace? [y/n]"
-            // prompt, which hangs the app when stdin is a TTY. Reaching here
-            // means we intend a fresh venv anyway.
-            .args(["venv", "--clear", "--python", PYTHON_VERSION])
-            .arg(venv_dir)
+            // --clear replaces a staging venv left by an interrupted rebuild
+            // without uv's interactive "already exists, replace? [y/n]" prompt,
+            // which hangs the app when stdin is a TTY. --relocatable keeps the
+            // venv's scripts working after it's moved into place.
+            .args(["venv", "--clear", "--relocatable", "--python", PYTHON_VERSION])
+            .arg(&staging)
             .env("UV_PYTHON_INSTALL_DIR", &runtimes)
             .env("UV_CACHE_DIR", &cache);
         if process::run(&mut create).is_err() {
             log_error("MicroserviceOperator", "failed to create venv with uv");
             installed = false;
-        }
-        if has_installs(&config.python_packages) {
+        } else if has_installs(&config.python_packages) {
             let uv_install = |offline: bool| {
                 let mut install = Command::new(&uv);
                 install.args(["pip", "install", "--python"]).arg(&interpreter);
@@ -335,8 +317,8 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     } else {
         // Fall back to the base venv interpreter's stdlib venv + pip.
         let base = venv_interpreter(&python_dir.join("venv"));
-        let _ = process::run(Command::new(&base).arg("-m").arg("venv").arg(venv_dir));
-        if has_installs(&config.python_packages) {
+        installed = process::run(Command::new(&base).args(["-m", "venv", "--clear"]).arg(&staging)).is_ok();
+        if installed && has_installs(&config.python_packages) {
             let mut install = Command::new(&interpreter);
             install.arg("-m").arg("pip").arg("install");
             add_packages(&mut install);
@@ -344,18 +326,65 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
             installed = process::run(&mut install).is_ok();
         }
     }
-    // Record the inputs we installed so we can skip/refresh next time. On
-    // failure leave the fingerprint unset so the next start retries the install
-    // (e.g. once the host is back online) instead of running an incomplete venv
-    // forever.
-    if installed {
-        let _ = std::fs::write(&fingerprint_file, &fingerprint);
-    } else {
+
+    if !installed {
         log_error(
             "MicroserviceOperator",
             &format!("failed to install Python packages into {}", venv_dir.display()),
         );
+        if existing {
+            log_info(
+                "MicroserviceOperator",
+                &format!("Keeping the existing venv at {}", venv_dir.display()),
+            );
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+        if !venv_interpreter(&staging).exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
     }
+    // Record the inputs we installed so we can skip/refresh next time. On
+    // failure leave the fingerprint unset so the next start retries the install
+    // (e.g. once the host is back online).
+    if installed {
+        let _ = std::fs::write(staging.join(fingerprint_name), &fingerprint);
+    }
+    if let Err(e) = swap_venv(&staging, venv_dir) {
+        log_error(
+            "MicroserviceOperator",
+            &format!("failed to move the new venv into {}: {e}", venv_dir.display()),
+        );
+    }
+}
+
+/// `path` with `.suffix` appended to its file name, e.g. `venv` -> `venv.staging`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Replace `venv_dir` with `staging`. The old venv is moved aside first and put
+/// back if the move fails, so there's always a venv at `venv_dir`. Callers
+/// ensure the process using the venv is stopped first.
+fn swap_venv(staging: &Path, venv_dir: &Path) -> std::io::Result<()> {
+    let old = sibling(venv_dir, "old");
+    let _ = std::fs::remove_dir_all(&old);
+    let had_old = venv_dir.exists();
+    if had_old {
+        std::fs::rename(venv_dir, &old)?;
+    }
+    if let Err(e) = std::fs::rename(staging, venv_dir) {
+        if had_old {
+            let _ = std::fs::rename(&old, venv_dir);
+        }
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
 }
 
 /// The Python version uv installs for the base venv and every host venv.
@@ -1175,7 +1204,9 @@ impl MicroserviceOperator {
             std::thread::spawn(move || {
                 ensure_venv(&python_dir, &venv, &config);
                 // ensure_venv only records the fingerprint after a successful
-                // install, so its absence means retry later.
+                // install, so its absence means retry later. A failed rebuild
+                // keeps the previous venv and its fingerprint, which is still
+                // usable.
                 let ready = venv.join(".openc3_pip_fingerprint").is_file();
                 discovery_state.store(if ready { DISCOVERY_READY } else { DISCOVERY_IDLE }, Ordering::SeqCst);
             });
@@ -1719,6 +1750,52 @@ fn log_error(scope: &str, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn venv_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("openc3_venv_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sibling_appends_a_suffix_to_the_file_name() {
+        assert_eq!(sibling(Path::new("/a/GOVEE_INT/venv"), "staging"), Path::new("/a/GOVEE_INT/venv.staging"));
+    }
+
+    #[test]
+    fn swap_venv_replaces_the_existing_venv() {
+        let dir = venv_test_dir("swap");
+        let venv = dir.join("venv");
+        let staging = dir.join("venv.staging");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join("marker"), "old").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("marker"), "new").unwrap();
+        swap_venv(&staging, &venv).unwrap();
+        assert_eq!(std::fs::read_to_string(venv.join("marker")).unwrap(), "new");
+        assert!(!staging.exists());
+        assert!(!dir.join("venv.old").exists());
+        // With no existing venv the staged one is moved into place
+        std::fs::remove_dir_all(&venv).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        swap_venv(&staging, &venv).unwrap();
+        assert!(venv.is_dir() && !staging.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_swap_venv_restores_the_existing_venv() {
+        let dir = venv_test_dir("restore");
+        let venv = dir.join("venv");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join("marker"), "old").unwrap();
+        // The staging venv doesn't exist, so the move fails
+        assert!(swap_venv(&dir.join("venv.staging"), &venv).is_err());
+        assert_eq!(std::fs::read_to_string(venv.join("marker")).unwrap(), "old");
+        assert!(!dir.join("venv.old").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn first_sync_is_required_before_starting() {
