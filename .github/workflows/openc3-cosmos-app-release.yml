@@ -140,7 +140,7 @@ jobs:
           all='[
             {"runner":"ubuntu-latest","name":"linux-x86_64","rust_target":"x86_64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
             {"runner":"ubuntu-24.04-arm","name":"linux-arm64","rust_target":"aarch64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
-            {"runner":"macos-14","name":"macos-arm64","rust_target":"aarch64-apple-darwin","packager_args":"-f dmg"},
+            {"runner":"macos-15","name":"macos-arm64","rust_target":"aarch64-apple-darwin","packager_args":"-f dmg"},
             {"runner":"windows-latest","name":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc","packager_args":"-f wix"}
           ]'
           if [ "$TARGET" = "all" ]; then
