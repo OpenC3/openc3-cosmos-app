@@ -137,9 +137,14 @@ jobs:
         run: |
           # Each job builds an explicit --target so the
           # build arch is independent of the runner arch.
+          # Linux runners are pinned (not ubuntu-latest): the binary links the
+          # build host's glibc, so building on a newer Ubuntu makes it refuse to
+          # run on older distros (e.g. GLIBC_2.43 not found on 24.04). 22.04 (glibc
+          # 2.35) is the oldest supported target; glibc is backward compatible, so
+          # the binary runs on 22.04 and everything newer.
           all='[
-            {"runner":"ubuntu-latest","name":"linux-x86_64","rust_target":"x86_64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
-            {"runner":"ubuntu-24.04-arm","name":"linux-arm64","rust_target":"aarch64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
+            {"runner":"ubuntu-22.04","name":"linux-x86_64","rust_target":"x86_64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
+            {"runner":"ubuntu-22.04-arm","name":"linux-arm64","rust_target":"aarch64-unknown-linux-gnu","packager_args":"-f deb -f appimage"},
             {"runner":"macos-15","name":"macos-arm64","rust_target":"aarch64-apple-darwin","packager_args":"-f dmg"},
             {"runner":"windows-latest","name":"windows-x86_64","rust_target":"x86_64-pc-windows-msvc","packager_args":"-f wix"}
           ]'
@@ -180,9 +185,13 @@ jobs:
           rustup target add ${{ matrix.rust_target }}
 
       # Caches the cargo registry, build target, and installed binaries (so
-      # cargo-packager isn't rebuilt every run). Keyed per-runner automatically.
+      # cargo-packager isn't rebuilt every run). The runner label is part of the
+      # key so a runner image change (and its glibc) never restores binaries
+      # linked against a different glibc.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.runner }}
 
       # GPUI's Linux backend links fontconfig/freetype, xkbcommon (X11 + Wayland)
       # and the Wayland/XCB client libraries at build time.
@@ -417,11 +426,17 @@ jobs:
 
   # Prove the .deb installs cleanly (dependencies resolve, binary runs) in a
   # fresh Ubuntu container. Runs whenever the linux-x86_64 target was built.
+  # Tests the oldest supported release (matching the build host's glibc) and
+  # the newest, so a too-new build host or a dropped dependency fails here.
   deb-smoke-test:
-    name: .deb install smoke test
+    name: .deb install smoke test (${{ matrix.image }})
     needs: build
     if: ${{ inputs.target == 'all' || inputs.target == 'linux-x86_64' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:latest"]
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -436,7 +451,7 @@ jobs:
 
       - name: Install the .deb in a clean Ubuntu container
         run: |
-          docker run --rm -v "$PWD/pkg:/pkg" ubuntu:24.04 bash -lc '
+          docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$PWD/pkg:/pkg" "${{ matrix.image }}" bash -lc '
             # No pipefail: pipelines here end in early-exit consumers (head/grep -q)
             # that SIGPIPE the upstream, which pipefail would treat as failure.
             set -eu
