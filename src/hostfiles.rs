@@ -60,17 +60,99 @@ pub fn sync(client: &BridgeClient, host_files_dir: &Path) -> Result<SyncResult> 
     for path in &delta.deletions {
         let _ = std::fs::remove_file(resolve(host_files_dir, path));
     }
+    // Remove the directories the deletions emptied (e.g. a plugin version that
+    // was uninstalled or upgraded), so their lib dirs leave PYTHONPATH
+    remove_empty_dirs(host_files_dir);
 
     let mut result = scan(host_files_dir);
-    result.pip_fingerprint = pip_fingerprint(&result);
+    result.pip_fingerprint = pip_fingerprint(&result.requirements, &result.projects);
     Ok(result)
+}
+
+impl SyncResult {
+    /// The Python dependency inputs of one plugin's synced files directory
+    /// (all plugins' when `None`), with their own fingerprint. Installs of the
+    /// same gem can need different packages, so `install` names the
+    /// microservice's plugin install's own files in that directory, used in
+    /// place of the gem's when they exist.
+    pub fn dependencies(&self, plugin_files: Option<&str>, install: &PluginInstall) -> SyncResult {
+        let Some(plugin_files) = plugin_files else {
+            return self.clone();
+        };
+        let in_plugin = |dir: Option<&Path>| {
+            dir.and_then(|d| d.file_name())
+                .is_some_and(|name| name == plugin_files)
+        };
+        // Relative paths only, so they can't point outside the plugin's directory
+        let install_file = install.requirements.as_deref().filter(|name| is_relative_path(name, false));
+        let install_project = install.project.as_deref().filter(|dir| is_relative_path(dir, true));
+        let requirements: Vec<PathBuf> = self
+            .requirements
+            .iter()
+            .filter(|path| in_plugin(path.parent()))
+            .map(|path| {
+                install_file
+                    .map(|name| path.with_file_name(name))
+                    .filter(|install| install.is_file())
+                    .unwrap_or_else(|| path.clone())
+            })
+            .collect();
+        let projects: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .filter(|dir| in_plugin(Some(dir)))
+            .map(|dir| {
+                install_project
+                    .map(|rel| resolve(dir, rel))
+                    .filter(|install| install.join("pyproject.toml").is_file())
+                    .unwrap_or_else(|| dir.clone())
+            })
+            .collect();
+        // The plugin's own libs come first on PYTHONPATH, so another version of
+        // the plugin (with the same module names) can't shadow them. Other
+        // plugins' libs stay importable after them.
+        let (mut lib_dirs, others): (Vec<PathBuf>, Vec<PathBuf>) = self
+            .lib_dirs
+            .iter()
+            .cloned()
+            .partition(|lib| lib.ancestors().any(|dir| dir.file_name().is_some_and(|name| name == plugin_files)));
+        lib_dirs.extend(others);
+        SyncResult {
+            lib_dirs,
+            pip_fingerprint: pip_fingerprint(&requirements, &projects),
+            requirements,
+            projects,
+        }
+    }
+}
+
+/// A plugin install's own Python dependency files in its plugin's synced files
+/// directory (sent by COSMOS versions that sync them per install).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PluginInstall {
+    /// Its requirements file, e.g. `requirements__1.txt`.
+    pub requirements: Option<String>,
+    /// The directory of its `pyproject.toml`, e.g. `installs/1`.
+    pub project: Option<String>,
+}
+
+/// Whether `path` is a `/`-separated relative path of plain names (a single
+/// file name unless `nested`).
+fn is_relative_path(path: &str, nested: bool) -> bool {
+    let mut parts = path.split('/');
+    let valid = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']);
+    if nested {
+        parts.all(valid)
+    } else {
+        parts.next().is_some_and(valid) && parts.next().is_none()
+    }
 }
 
 /// Fingerprint the venv-affecting inputs (requirements.txt + pyproject.toml
 /// contents), sorted, so a plugin upgrade that changes them updates the venv.
-fn pip_fingerprint(result: &SyncResult) -> String {
-    let mut inputs: Vec<PathBuf> = result.requirements.clone();
-    for project in &result.projects {
+fn pip_fingerprint(requirements: &[PathBuf], projects: &[PathBuf]) -> String {
+    let mut inputs: Vec<PathBuf> = requirements.to_vec();
+    for project in projects {
         inputs.push(project.join("pyproject.toml"));
     }
     inputs.sort();
@@ -97,6 +179,25 @@ fn resolve(base: &Path, rel: &str) -> PathBuf {
         path.push(component);
     }
     path
+}
+
+/// Remove the empty directories under `dir` (not `dir` itself). Returns
+/// whether `dir` is left empty.
+fn remove_empty_dirs(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut empty = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Not following symlinks, which the sync never creates
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_dir && remove_empty_dirs(&path) && std::fs::remove_dir(&path).is_ok() {
+            continue;
+        }
+        empty = false;
+    }
+    empty
 }
 
 /// Build the current on-disk manifest: `<relative/path> -> sha256 hex`.
@@ -141,22 +242,35 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Scan the synced tree for host runner inputs: `<gem>/lib` dirs, and any
-/// `<gem>/requirements.txt` / `<gem>/pyproject.toml`.
+/// Scan the synced tree for host runner inputs: `<gem>/lib` and
+/// `<gem>/targets/<TARGET>/lib` dirs, and any `<gem>/requirements.txt` /
+/// `<gem>/pyproject.toml`.
 fn scan(host_files_dir: &Path) -> SyncResult {
     let mut result = SyncResult::default();
     let gem_dirs = match std::fs::read_dir(host_files_dir) {
         Ok(e) => e,
         Err(_) => return result,
     };
-    for gem in gem_dirs.flatten() {
-        let gem_path = gem.path();
+    // Sorted so PYTHONPATH has a stable order rather than the filesystem's
+    let mut gem_paths: Vec<PathBuf> = gem_dirs.flatten().map(|gem| gem.path()).collect();
+    gem_paths.sort();
+    for gem_path in gem_paths {
         if !gem_path.is_dir() {
             continue;
         }
         let lib = gem_path.join("lib");
         if lib.is_dir() {
             result.lib_dirs.push(lib);
+        }
+        // Interfaces and their helpers often live in a target's lib dir
+        if let Ok(targets) = std::fs::read_dir(gem_path.join("targets")) {
+            let mut target_libs: Vec<PathBuf> = targets
+                .flatten()
+                .map(|target| target.path().join("lib"))
+                .filter(|lib| lib.is_dir())
+                .collect();
+            target_libs.sort();
+            result.lib_dirs.extend(target_libs);
         }
         if gem_path.join("requirements.txt").is_file() {
             result.requirements.push(gem_path.join("requirements.txt"));
@@ -166,4 +280,138 @@ fn scan(host_files_dir: &Path) -> SyncResult {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_finds_gem_and_target_lib_dirs() {
+        let root = std::env::temp_dir().join(format!("openc3_hostfiles_{}", std::process::id()));
+        let gem = root.join("plugin-1.0.0");
+        for dir in ["lib", "targets/B/lib", "targets/A/lib", "targets/C/cmd_tlm"] {
+            std::fs::create_dir_all(gem.join(dir)).unwrap();
+        }
+        std::fs::write(gem.join("requirements.txt"), "requests\n").unwrap();
+        let result = scan(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            result.lib_dirs,
+            vec![
+                gem.join("lib"),
+                gem.join("targets/A/lib"),
+                gem.join("targets/B/lib")
+            ]
+        );
+        assert_eq!(result.requirements, vec![gem.join("requirements.txt")]);
+    }
+
+    #[test]
+    fn dependencies_are_limited_to_one_plugin() {
+        let root = PathBuf::from("/host_files");
+        let result = SyncResult {
+            lib_dirs: vec![root.join("a/lib"), root.join("b/lib")],
+            requirements: vec![
+                root.join("a/requirements.txt"),
+                root.join("b/requirements.txt"),
+            ],
+            projects: vec![root.join("b")],
+            pip_fingerprint: "all".to_string(),
+        };
+        let a = result.dependencies(Some("a"), &PluginInstall::default());
+        assert_eq!(a.requirements, vec![root.join("a/requirements.txt")]);
+        assert!(a.projects.is_empty());
+        // Other plugins' libs stay importable, after the plugin's own
+        assert_eq!(a.lib_dirs, result.lib_dirs);
+        let b_libs = result.dependencies(Some("b"), &PluginInstall::default()).lib_dirs;
+        assert_eq!(b_libs, vec![root.join("b/lib"), root.join("a/lib")]);
+        let b = result.dependencies(Some("b"), &PluginInstall::default());
+        assert_eq!(b.projects, vec![root.join("b")]);
+        assert_eq!(result.dependencies(None, &PluginInstall::default()).requirements.len(), 2);
+    }
+
+    #[test]
+    fn dependencies_use_the_install_files() {
+        let root = std::env::temp_dir().join(format!("openc3_hostfiles_install_{}", std::process::id()));
+        let gem = root.join("plugin-1.0.0");
+        std::fs::create_dir_all(gem.join("installs/1")).unwrap();
+        std::fs::write(gem.join("requirements.txt"), "wled\n").unwrap();
+        std::fs::write(gem.join("requirements__1.txt"), "govee\n").unwrap();
+        std::fs::write(gem.join("pyproject.toml"), "wled").unwrap();
+        std::fs::write(gem.join("installs/1/pyproject.toml"), "govee").unwrap();
+        let result = scan(&root);
+        let install = |requirements: &str, project: &str| PluginInstall {
+            requirements: Some(requirements.to_string()),
+            project: Some(project.to_string()),
+        };
+        let deps = result.dependencies(Some("plugin-1.0.0"), &install("requirements__1.txt", "installs/1"));
+        assert_eq!(deps.requirements, vec![gem.join("requirements__1.txt")]);
+        assert_eq!(deps.projects, vec![gem.join("installs").join("1")]);
+        // Files that weren't synced fall back to the gem's
+        let first = result.dependencies(Some("plugin-1.0.0"), &install("requirements__0.txt", "installs/0"));
+        assert_eq!(first.requirements, vec![gem.join("requirements.txt")]);
+        assert_eq!(first.projects, vec![gem.clone()]);
+        // Each install's files give it its own fingerprint
+        assert_ne!(deps.pip_fingerprint, first.pip_fingerprint);
+        // Only paths in the plugin's directory are used
+        let escape = result.dependencies(
+            Some("plugin-1.0.0"),
+            &install("../plugin-1.0.0/requirements__1.txt", "../plugin-1.0.0/installs/1"),
+        );
+        assert_eq!(escape.requirements, vec![gem.join("requirements.txt")]);
+        assert_eq!(escape.projects, vec![gem.clone()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_plugins_own_libs_come_before_other_versions() {
+        let root = PathBuf::from("/host_files");
+        let result = SyncResult {
+            lib_dirs: vec![
+                root.join("ha-3.0.0/targets/HA/lib"),
+                root.join("demo-1.0.0/lib"),
+                root.join("ha-4.0.0/lib"),
+                root.join("ha-4.0.0/targets/HA/lib"),
+            ],
+            ..SyncResult::default()
+        };
+        let deps = result.dependencies(Some("ha-4.0.0"), &PluginInstall::default());
+        assert_eq!(
+            deps.lib_dirs,
+            vec![
+                root.join("ha-4.0.0/lib"),
+                root.join("ha-4.0.0/targets/HA/lib"),
+                root.join("ha-3.0.0/targets/HA/lib"),
+                root.join("demo-1.0.0/lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_dirs_are_removed() {
+        let root = std::env::temp_dir().join(format!("openc3_hostfiles_empty_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("old-1.0.0/targets/HA/lib/ha")).unwrap();
+        std::fs::create_dir_all(root.join("new-2.0.0/lib/pkg/empty")).unwrap();
+        std::fs::write(root.join("new-2.0.0/lib/pkg/module.py"), "").unwrap();
+        assert!(!remove_empty_dirs(&root));
+        assert!(!root.join("old-1.0.0").exists());
+        assert!(!root.join("new-2.0.0/lib/pkg/empty").exists());
+        assert!(root.join("new-2.0.0/lib/pkg/module.py").is_file());
+        // The synced files directory itself is kept
+        std::fs::remove_dir_all(root.join("new-2.0.0")).unwrap();
+        assert!(remove_empty_dirs(&root));
+        assert!(root.is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn relative_paths_are_plain_names() {
+        assert!(is_relative_path("requirements__1.txt", false));
+        assert!(!is_relative_path("installs/1", false));
+        assert!(is_relative_path("installs/1", true));
+        for path in ["", "..", "a/../b", "/abs", "a//b", "a\\b", "C:x"] {
+            assert!(!is_relative_path(path, true), "{path}");
+        }
+    }
 }

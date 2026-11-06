@@ -23,6 +23,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod bridge;
+mod child_guard;
 mod cli;
 mod commands;
 mod context;
@@ -33,9 +34,11 @@ mod enroll;
 mod env_file;
 mod hostfiles;
 mod install;
+mod lifecycle;
 mod logging;
 mod monitor;
 mod operator;
+mod orphans;
 mod process;
 // Settings (COSMOS URL, run-locally) are only consumed by the GUI.
 #[cfg(feature = "gui")]
@@ -207,7 +210,18 @@ fn run(cli: Cli) -> Result<()> {
                 Box::new(move || enroll::connect_bridge(&connect_ctx)),
                 Box::new(move || monitor::cosmos_readiness(&ready_ctx, false)),
             );
+            // Ctrl-C / SIGTERM / closing the console stop the microservices
+            // gracefully (instead of orphaning them) before we exit.
+            crate::lifecycle::install();
+            let shutdown = op.shutdown_handle();
+            std::thread::spawn(move || {
+                while !crate::lifecycle::requested() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
             op.run();
+            crate::lifecycle::cleanup_finished();
             Ok(())
         }
         Command::BridgeEnroll { token } => {

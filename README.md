@@ -16,7 +16,7 @@ The app provides these functions (see `requirements.md`):
    `cosmos/` subfolder.
 4. **Launch & monitor** — brings the COSMOS containers up with docker compose
    and continuously monitors their health.
-5. **GUI** — an [Iced](https://iced.rs)-based control panel, on by default, with
+5. **GUI** — a [GPUI](https://gpui.rs)-based (GPU-accelerated) control panel, on by default, with
    a fully headless mode.
 6. **CLI** — command-line functionality equivalent to `openc3.sh`.
 7. **Host interfaces (the "bridge")** — supervises host-side Python
@@ -97,7 +97,7 @@ treat the install as COSMOS Enterprise.
 
 ## GUI control panel
 
-Launched by default (or with `openc3 gui`), the Iced control panel provides:
+Launched by default (or with `openc3 gui`), the GPUI control panel provides:
 
 - **Start / open / shutdown COSMOS** with a live readiness state, plus a
   **Container Status** table (health, uptime, CPU/memory) read from the Docker

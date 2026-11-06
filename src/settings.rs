@@ -147,15 +147,23 @@ impl Settings {
     /// Whether bridge functionality should run. An explicit setting wins;
     /// otherwise it is enabled only for COSMOS 7.4.0 or newer. Development mode
     /// represents the current source tree (`latest`), so it supports the bridge.
+    ///
+    /// Reads the COSMOS `.env` file, so call it off the UI thread; the GUI
+    /// caches the installed version and uses [`Self::bridge_enabled_for`].
     pub fn bridge_enabled(&self, cosmos_env: &std::path::Path) -> bool {
+        self.bridge_enabled_for(crate::update::installed_cosmos_version(cosmos_env).as_deref())
+    }
+
+    /// [`Self::bridge_enabled`] given an already-known installed COSMOS version
+    /// (`None` when not installed / unknown). Pure — safe on the UI thread.
+    pub fn bridge_enabled_for(&self, installed_cosmos: Option<&str>) -> bool {
         if let Some(disabled) = self.disable_bridge {
             return !disabled;
         }
         if self.dev_mode {
             return true;
         }
-        crate::update::installed_cosmos_version(cosmos_env)
-            .is_some_and(|version| crate::update::is_at_least(&version, "7.4.0"))
+        installed_cosmos.is_some_and(|version| crate::update::is_at_least(version, "7.4.0"))
     }
 }
 

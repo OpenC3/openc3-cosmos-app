@@ -297,7 +297,7 @@ handshake) rather than after the network hop.
 
 ## 7. openc3-cosmos-app: control-plane client & supervisor
 
-openc3-cosmos-app is a single cross-platform binary (Iced GUI + headless CLI). Its
+openc3-cosmos-app is a single cross-platform binary (GPUI GUI + headless CLI). Its
 `MicroserviceOperator` runs a supervision loop that, each cycle:
 
 1. **`maybe_connect()`** — establishes/re-establishes the bridge connection.

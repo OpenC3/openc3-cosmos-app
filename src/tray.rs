@@ -11,16 +11,16 @@
 
 //! System tray / menu-bar integration for "minimize (hide) to tray".
 //!
-//! Iced has no built-in tray support, so on Windows and macOS we add a
-//! `tray-icon` icon with a Show/Quit menu. Closing the window hides it (Iced
-//! `Mode::Hidden`) instead of quitting; the tray restores or quits it. On other
+//! GPUI has no built-in tray support, so on Windows and macOS we add a
+//! `tray-icon` icon with a Show/Quit menu. Closing the window closes only the
+//! window (the app keeps running); the tray reopens it or quits. On other
 //! platforms (Linux) there is no tray — the window minimizes instead, and these
 //! functions are no-ops.
 //!
 //! The tray icon must be created on the main/event-loop thread after the app is
 //! initialized (macOS requires an initialized `NSApplication`); [`init`] is
-//! therefore called from Iced's boot closure. Menu clicks are delivered on that
-//! thread's run loop into a global channel that [`poll`] drains.
+//! therefore called from the GPUI `run` closure. Menu clicks are delivered on that
+//! thread's run loop into a global channel that [`poll`] drains (non-blocking).
 
 /// Whether a real tray is available on this platform (drives close = hide vs
 /// minimize).
@@ -206,7 +206,7 @@ pub fn set_dock_visible(visible: bool) {
         use objc2::{class, msg_send};
         // NSApplicationActivationPolicy: Regular = 0 (Dock icon shown),
         // Accessory = 1 (no Dock icon). Must be called on the main thread — the
-        // iced update loop, our only caller, runs there.
+        // GPUI main thread, our only caller, runs there.
         let policy: isize = if visible { 0 } else { 1 };
         unsafe {
             let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];

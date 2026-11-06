@@ -17,6 +17,7 @@
 
 use crate::context::Context;
 use crate::download;
+use crate::operator::PYTHON_VERSION;
 use crate::process;
 use anyhow::{bail, Context as _, Result};
 use std::cell::RefCell;
@@ -104,7 +105,6 @@ const COSMOS_PROJECT_REPO: &str = "https://github.com/OpenC3/cosmos-project";
 /// archives are fetched from the Gitea-compatible API with a token.
 const ENTERPRISE_ARCHIVE_BASE: &str =
     "https://repos.openc3.com/api/v1/repos/OpenC3/cosmos-enterprise-project/archive";
-const DEFAULT_PYTHON: &str = "3.12";
 
 /// Install everything in dependency order.
 pub fn all(ctx: &Context) -> Result<()> {
@@ -677,10 +677,10 @@ pub fn python(ctx: &Context) -> Result<()> {
     let install_dir = runtimes.clone();
     let cache = ctx.paths.python.join("cache");
 
-    notify(format!("Installing Python {DEFAULT_PYTHON} into {}", runtimes.display()));
+    notify(format!("Installing Python {PYTHON_VERSION} into {}", runtimes.display()));
     let mut install = Command::new(&uv);
     install
-        .args(["python", "install", DEFAULT_PYTHON])
+        .args(["python", "install", "--no-bin", PYTHON_VERSION])
         .env("UV_PYTHON_INSTALL_DIR", &install_dir)
         .env("UV_CACHE_DIR", &cache);
     process::run(&mut install)?;
@@ -688,7 +688,7 @@ pub fn python(ctx: &Context) -> Result<()> {
     notify(format!("Creating virtual environment at {}", venv.display()));
     let mut mkvenv = Command::new(&uv);
     mkvenv
-        .args(["venv", "--python", DEFAULT_PYTHON])
+        .args(["venv", "--python", PYTHON_VERSION])
         .arg(&venv)
         .env("UV_PYTHON_INSTALL_DIR", &install_dir)
         .env("UV_CACHE_DIR", &cache);
@@ -717,7 +717,7 @@ fn prewarm_host_packages(uv: &Path, cache: &Path, install_dir: &Path, python_dir
     let result = (|| -> Result<()> {
         let mut mkvenv = Command::new(uv);
         mkvenv
-            .args(["venv", "--clear", "--python", DEFAULT_PYTHON])
+            .args(["venv", "--clear", "--python", PYTHON_VERSION])
             .arg(&scratch)
             .env("UV_PYTHON_INSTALL_DIR", install_dir)
             .env("UV_CACHE_DIR", cache);
