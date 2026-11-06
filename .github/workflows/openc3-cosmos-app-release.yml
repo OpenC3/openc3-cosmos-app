@@ -327,7 +327,7 @@ jobs:
       # `notarytool submit --wait` (it hung for 24 min on Apple's queue with no
       # output). Here we get streamed progress, a hard per-attempt --timeout, one
       # retry for transient Apple stalls, the notary log on failure, and a
-      # stapled ticket so the DMG passes Gatekeeper offline. Skipped (leaving the
+      # stapled ticket (retried) so the DMG passes Gatekeeper offline. Skipped (leaving the
       # DMG signed but un-notarized) when credentials are absent.
       - name: Notarize and staple the DMG (macOS)
         if: runner.os == 'macOS'
@@ -372,10 +372,25 @@ jobs:
             fi
           fi
 
-          echo "Stapling $dmg"
-          xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-          echo "OK: notarized and stapled $dmg"
+          # Stapling fetches the ticket from Apple's CloudKit, which flakes:
+          # dropped connections (NSURLError -1005 → stapler error 68) and the
+          # ticket not yet propagated right after "Accepted" (error 65). The
+          # notarization itself already succeeded, so retry with backoff rather
+          # than failing the release.
+          for i in 1 2 3 4 5; do
+            echo "Stapling $dmg (attempt $i/5)"
+            if xcrun stapler staple "$dmg" && xcrun stapler validate "$dmg"; then
+              echo "OK: notarized and stapled $dmg"
+              exit 0
+            fi
+            if [ "$i" -lt 5 ]; then
+              delay=$((i * 30))
+              echo "::warning::Stapling attempt $i failed; retrying in ${delay}s…"
+              sleep "$delay"
+            fi
+          done
+          echo "::error::Stapling failed 5 times for $dmg (notarization was accepted)"
+          exit 1
 
       # Also ship the standalone binary as a .tar.gz so non-Debian distros (and
       # anyone who doesn't want the .deb/AppImage) can just extract and run it.
