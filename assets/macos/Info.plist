@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged by cargo-packager into the generated OpenC3_COSMOS.app Info.plist
+  (see `info-plist-path` in Cargo.toml).
+
+  The Python discovery/scan and host-interface processes this app spawns are
+  attributed to the app by TCC (it is their "responsible process"), so their
+  privacy-sensitive access is checked against THIS plist. Without a usage
+  description, macOS kills the child with SIGABRT the moment it touches the
+  protected API (e.g. bleak -> CoreBluetooth during Bluetooth discovery).
+-->
+<plist version="1.0">
+<dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>OpenC3 COSMOS discovers and connects to Bluetooth devices so they can be used as COSMOS interfaces.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OpenC3 COSMOS discovers devices on your local network so they can be used as COSMOS interfaces.</string>
+</dict>
+</plist>

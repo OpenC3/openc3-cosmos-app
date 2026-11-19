@@ -143,6 +143,10 @@ minimum-system-version = "11.0"
 # "Developer ID Application: …" identity when signing secrets are present, which
 # also enables notarization.
 signing-identity = "-"
+# Extra keys merged into the generated Info.plist — privacy usage descriptions
+# that the spawned Python discovery/host processes need (TCC attributes them to
+# this app and aborts them if the description is missing).
+info-plist-path = "assets/macos/Info.plist"
 
 # GPUI's Linux backend needs libxkbcommon (keyboard handling on X11 and
 # Wayland), fontconfig/freetype (font discovery) and a Vulkan loader (GPU

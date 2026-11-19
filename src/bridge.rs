@@ -452,6 +452,10 @@ async fn discovery_worker(endpoint: Endpoint, addr: EndpointAddr, runner: Discov
                     Some(scan) => ("scan", run_scan(current, scan).await),
                     None => ("results", run_discovery(current, &request.discovery).await),
                 };
+                if let Err(error) = &result {
+                    let what = if key == "scan" { "Hardware scan" } else { "Discovery" };
+                    crate::logging::warn("bridge", &format!("{what} failed: {error}"));
+                }
                 if let Err(error) = post_discovery_result(&endpoint, &addr, &request.id, key, result).await {
                     crate::logging::warn("bridge", &format!("Failed to return discovery result: {error}"));
                 }
@@ -540,7 +544,7 @@ async fn run_discovery(
         Ok(Err(error)) => return Err(format!("failed to run discovery: {error}")),
         Err(_) => return Err(format!("discovery timed out after {}s", DISCOVERY_RUN_TIMEOUT.as_secs())),
     };
-    parse_discovery_output(&output.stdout, &output.stderr)
+    parse_discovery_output(&output.stdout, &output.stderr, exit_description(output.status).as_deref())
 }
 
 /// Run `python -m openc3.discovery.discovery_scan` with the scan request on
@@ -582,17 +586,17 @@ async fn run_scan(runner: Option<DiscoveryRunner>, scan: &serde_json::Value) -> 
         Ok(Err(error)) => return Err(error),
         Err(_) => return Err(format!("hardware scan timed out after {}s", DISCOVERY_SCAN_TIMEOUT.as_secs())),
     };
-    parse_scan_output(&output.stdout, &output.stderr)
+    parse_scan_output(&output.stdout, &output.stderr, exit_description(output.status).as_deref())
 }
 
 /// Interpret the scan's stdout (`{"devices", ...}` or `{"error": "..."}`).
-fn parse_scan_output(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+fn parse_scan_output(stdout: &[u8], stderr: &[u8], exit: Option<&str>) -> Result<serde_json::Value, String> {
     match last_json_line(stdout) {
         Some(value) if value.get("devices").is_some() => Ok(value),
         Some(value) if value.get("error").is_some() => {
             Err(value["error"].as_str().unwrap_or("hardware scan failed").to_string())
         }
-        _ => Err(format!("hardware scan failed: {}", last_line(stderr))),
+        _ => Err(format!("hardware scan failed: {}", failure_reason(stderr, exit))),
     }
 }
 
@@ -605,21 +609,56 @@ fn last_json_line(stdout: &[u8]) -> Option<serde_json::Value> {
         .and_then(|line| serde_json::from_str(line).ok())
 }
 
-/// The last non-empty line of stderr, which explains a failure to start.
-fn last_line(stderr: &[u8]) -> String {
+/// Why a Python run produced no JSON: the last non-empty line of stderr (which
+/// explains a failure to start), else how the process exited. A process killed
+/// by a signal writes nothing — e.g. macOS TCC aborts (SIGABRT) a child that
+/// touches Bluetooth when the app's Info.plist lacks a usage description.
+fn failure_reason(stderr: &[u8], exit: Option<&str>) -> String {
     let stderr = String::from_utf8_lossy(stderr);
-    stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output").to_string()
+    match stderr.lines().rev().find(|line| !line.trim().is_empty()) {
+        Some(line) => line.to_string(),
+        None => match exit {
+            Some(exit) => format!("Python {exit} with no output"),
+            None => "no output".to_string(),
+        },
+    }
+}
+
+/// Describe an unsuccessful exit (`exited with code 1`, `was killed by signal
+/// 6 (SIGABRT)`), or `None` for success.
+fn exit_description(status: std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            let name = match signal {
+                6 => " (SIGABRT)",
+                9 => " (SIGKILL)",
+                11 => " (SIGSEGV)",
+                15 => " (SIGTERM)",
+                _ => "",
+            };
+            return Some(format!("was killed by signal {signal}{name}"));
+        }
+    }
+    Some(match status.code() {
+        Some(code) => format!("exited with code {code}"),
+        None => "exited abnormally".to_string(),
+    })
 }
 
 /// Interpret the runner's stdout (`{"results": [...]}` or `{"error": "..."}`).
-fn parse_discovery_output(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+fn parse_discovery_output(stdout: &[u8], stderr: &[u8], exit: Option<&str>) -> Result<serde_json::Value, String> {
     match last_json_line(stdout) {
         Some(value) if value.get("results").is_some() => Ok(value["results"].clone()),
         Some(value) if value.get("error").is_some() => {
             Err(value["error"].as_str().unwrap_or("discovery failed").to_string())
         }
         // No JSON at all, e.g. Python failed to start or openc3 isn't installed
-        _ => Err(format!("discovery failed: {}", last_line(stderr))),
+        _ => Err(format!("discovery failed: {}", failure_reason(stderr, exit))),
     }
 }
 
@@ -632,6 +671,7 @@ mod tests {
         let results = parse_discovery_output(
             b"{\"results\": [{\"value\": \"COM3\", \"text\": \"COM3\"}]}\n",
             b"",
+            None,
         )
         .unwrap();
         assert_eq!(results, serde_json::json!([{ "value": "COM3", "text": "COM3" }]));
@@ -639,7 +679,7 @@ mod tests {
 
     #[test]
     fn parses_discovery_errors() {
-        let error = parse_discovery_output(b"{\"error\": \"RuntimeError: no hidapi\"}\n", b"").unwrap_err();
+        let error = parse_discovery_output(b"{\"error\": \"RuntimeError: no hidapi\"}\n", b"", None).unwrap_err();
         assert_eq!(error, "RuntimeError: no hidapi");
     }
 
@@ -648,9 +688,18 @@ mod tests {
         let error = parse_discovery_output(
             b"",
             b"Traceback (most recent call last):\nModuleNotFoundError: No module named 'openc3'\n",
+            Some("exited with code 1"),
         )
         .unwrap_err();
         assert_eq!(error, "discovery failed: ModuleNotFoundError: No module named 'openc3'");
+    }
+
+    #[test]
+    fn reports_exit_status_when_killed_silently() {
+        let error = parse_discovery_output(b"", b"", Some("was killed by signal 6 (SIGABRT)")).unwrap_err();
+        assert_eq!(error, "discovery failed: Python was killed by signal 6 (SIGABRT) with no output");
+        let error = parse_scan_output(b"", b"", None).unwrap_err();
+        assert_eq!(error, "hardware scan failed: no output");
     }
 
     #[test]
@@ -658,12 +707,13 @@ mod tests {
         let scan = parse_scan_output(
             b"{\"devices\": [{\"value\": \"abc\", \"matches\": [\"1\"]}], \"errors\": {}, \"skipped\": {}}\n",
             b"",
+            None,
         )
         .unwrap();
         assert_eq!(scan["devices"][0]["matches"], serde_json::json!(["1"]));
-        let error = parse_scan_output(b"{\"error\": \"JSONDecodeError: bad\"}\n", b"").unwrap_err();
+        let error = parse_scan_output(b"{\"error\": \"JSONDecodeError: bad\"}\n", b"", None).unwrap_err();
         assert_eq!(error, "JSONDecodeError: bad");
-        let error = parse_scan_output(b"", b"No module named openc3.discovery.discovery_scan\n").unwrap_err();
+        let error = parse_scan_output(b"", b"No module named openc3.discovery.discovery_scan\n", Some("exited with code 1")).unwrap_err();
         assert_eq!(error, "hardware scan failed: No module named openc3.discovery.discovery_scan");
     }
 
