@@ -251,6 +251,11 @@ pub struct AppState {
     pub bridge_pairing: bool,
     pub microservices: Vec<MicroserviceStatus>,
     pub bridge_status: BridgeConnectionStatus,
+    /// The saved bridge pairing (refreshed when the bridge status changes and
+    /// after pairing/unpairing); `None` when unpaired.
+    pub pairing: Option<crate::enroll::Pairing>,
+    /// The "Unpair from COSMOS?" confirmation is open.
+    pub unpair_confirm: bool,
 
     /// Snapshot of captured log records for the log table.
     pub log_records: Vec<LogRecord>,
@@ -381,6 +386,8 @@ impl AppState {
             bridge_pairing: false,
             microservices: Vec::new(),
             bridge_status: BridgeConnectionStatus::default(),
+            pairing: None,
+            unpair_confirm: false,
             log_records: Vec::new(),
             log_generation: u64::MAX,
             log_level: LogLevelFilter::Info,
@@ -411,6 +418,7 @@ impl AppState {
         crate::logging::info(APP, "OpenC3 COSMOS control panel ready.");
         // The host microservice operator starts once this first environment
         // check has detected the container runtime (see apply_env).
+        state.pairing = crate::enroll::current_pairing(&state.ctx.paths.root);
         state.refresh_env(cx);
         state
     }
@@ -475,6 +483,9 @@ impl AppState {
             if let Ok(status) = op.bridge_status.lock() {
                 if *status != self.bridge_status {
                     self.bridge_status = status.clone();
+                    // Enrollment, re-enrollment and token pairing all land in
+                    // a status change, so re-read the saved pairing here.
+                    self.pairing = crate::enroll::current_pairing(&self.ctx.paths.root);
                     changed = true;
                 }
             }
@@ -1281,6 +1292,31 @@ impl AppState {
         self.bridge_retry.store(true, Ordering::Relaxed);
         self.bridge_status.message = "Retrying…".to_string();
         crate::logging::info("bridge", "Retrying bridge connection…");
+        cx.notify();
+    }
+
+    /// Ask to unpair from the bridge — opens the confirmation modal.
+    pub fn request_unpair(&mut self, cx: &mut Cx<Self>) {
+        self.unpair_confirm = true;
+        cx.notify();
+    }
+
+    pub fn cancel_unpair(&mut self, cx: &mut Cx<Self>) {
+        self.unpair_confirm = false;
+        cx.notify();
+    }
+
+    /// Drop the saved pairing (manual tokens included) and restart the operator
+    /// so host microservices stop using the old ticket. A co-located COSMOS is
+    /// then auto-enrolled again; a remote one needs a new token.
+    pub fn confirm_unpair(&mut self, cx: &mut Cx<Self>) {
+        self.unpair_confirm = false;
+        if let Err(e) = crate::enroll::unpair(&self.ctx.paths.root) {
+            crate::logging::error("bridge", &format!("Unpair failed: {e:#}"));
+        }
+        self.pairing = crate::enroll::current_pairing(&self.ctx.paths.root);
+        self.bridge_status = BridgeConnectionStatus::default();
+        self.restart_operator(false, cx);
         cx.notify();
     }
 

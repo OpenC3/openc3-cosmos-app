@@ -1022,7 +1022,7 @@ impl MicroserviceOperator {
             Err(reason) => {
                 let gave_up = self.enroll_attempts >= BRIDGE_MAX_ATTEMPTS;
                 self.unpaired_reason = Some(if gave_up {
-                    format!("auto-enroll failed after {BRIDGE_MAX_ATTEMPTS} tries — pair with a token ({reason})")
+                    format!("gave up after {BRIDGE_MAX_ATTEMPTS} tries — press Retry ({reason})")
                 } else {
                     reason
                 });
@@ -1240,8 +1240,8 @@ impl MicroserviceOperator {
     fn fetch(&mut self) -> ConfigMap {
         let Some(client) = &self.bridge_client else {
             let message = match &self.unpaired_reason {
-                Some(reason) => format!("Not paired with COSMOS: {reason}"),
-                None => "Not paired with COSMOS".to_string(),
+                Some(reason) => format!("Not connected to COSMOS: {reason}"),
+                None => "Not connected to COSMOS".to_string(),
             };
             self.publish_bridge_status(false, false, &message);
             return ConfigMap::new();
