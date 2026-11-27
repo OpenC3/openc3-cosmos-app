@@ -16,6 +16,7 @@
 
 use super::app_state::{level_rank, AppState, LogLevelFilter, Page};
 use super::ui::{self, color};
+use crate::enroll::Pairing;
 use crate::logging::LogRecord;
 use crate::monitor::{self, ContainerStatus, RunState};
 use crate::settings::{Edition, DEFAULT_COSMOS_URL};
@@ -807,11 +808,15 @@ impl MainView {
     fn bridge(&self, s: &AppState, cx: &App) -> Div {
         let (label, tint) = bridge_state(s);
         let message = if s.bridge_status.message.is_empty() {
-            "Not paired with COSMOS".to_string()
+            "Not connected to COSMOS".to_string()
         } else {
             s.bridge_status.message.clone()
         };
-        let mut header = ui::card_header(IconName::Cable, "Bridge").child(ui::pill(label, tint)).child(div().flex_1());
+        let (pair_label, pair_tint) = pairing_state(s);
+        let mut header = ui::card_header(IconName::Cable, "Bridge")
+            .child(ui::pill(label, tint))
+            .child(ui::pill(pair_label, pair_tint))
+            .child(div().flex_1());
         // Offer a manual retry whenever the bridge isn't connected (auto-enroll
         // gives up after a few tries per COSMOS up-session).
         if s.bridge_enabled() && !s.bridge_status.connected {
@@ -822,6 +827,19 @@ impl MainView {
                     .icon(IconName::RotateCcw)
                     .label("Retry")
                     .on_click(self.act(|s, cx| s.retry_bridge(cx))),
+            );
+        }
+        // Unpair drops the saved pairing (e.g. a manual token whose hub was
+        // recreated with a new identity). An env-var ticket can't be unpaired.
+        if matches!(s.pairing, Some(Pairing::Auto(_) | Pairing::Manual(_))) {
+            header = header.child(
+                Button::new("unpair-bridge")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Unplug)
+                    .label("Unpair")
+                    .disabled(s.bridge_pairing)
+                    .on_click(self.act(|s, cx| s.request_unpair(cx))),
             );
         }
         let mut card = ui::card().child(header).child(
@@ -1272,6 +1290,31 @@ impl MainView {
         if s.cleanup_confirm {
             overlays.push(self.cleanup_modal(cx));
         }
+        if s.unpair_confirm {
+            let message = match &s.pairing {
+                Some(Pairing::Manual(bridge)) => format!(
+                    "This forgets the enrollment token for bridge '{bridge}' and stops host interfaces. \
+                     To pair again with a remote COSMOS you'll need a new token from Admin → Bridges; \
+                     a COSMOS running locally is re-paired automatically."
+                ),
+                Some(Pairing::Auto(bridge)) => format!(
+                    "This forgets the pairing with bridge '{bridge}' and stops host interfaces. \
+                     A COSMOS running locally is re-paired automatically."
+                ),
+                _ => "This forgets the saved bridge pairing and stops host interfaces.".to_string(),
+            };
+            overlays.push(confirm_modal(
+                "unpair-modal",
+                IconName::Unplug,
+                color::warning(),
+                "Unpair from COSMOS?",
+                message,
+                vec![
+                    Button::new("cancel-unpair").ghost().label("Cancel").on_click(self.act(|s, cx| s.cancel_unpair(cx))),
+                    Button::new("confirm-unpair").danger().label("Unpair").on_click(self.act(|s, cx| s.confirm_unpair(cx))),
+                ],
+            ));
+        }
         if s.restart_pending {
             overlays.push(confirm_modal(
                 "restart-modal",
@@ -1679,7 +1722,17 @@ fn bridge_state(s: &AppState) -> (&'static str, Hsla) {
     } else if s.bridge_status.configured {
         ("Connecting", color::warning())
     } else {
-        ("Not paired", color::muted())
+        ("Not connected", color::muted())
+    }
+}
+
+/// Saved-pairing label + color (independent of whether the link is up).
+fn pairing_state(s: &AppState) -> (String, Hsla) {
+    match &s.pairing {
+        Some(Pairing::Auto(bridge)) => (format!("Paired · {bridge}"), color::success()),
+        Some(Pairing::Manual(bridge)) => (format!("Paired · {bridge} (token)"), color::success()),
+        Some(Pairing::Environment) => ("Paired · env ticket".to_string(), color::success()),
+        None => ("Unpaired".to_string(), color::muted()),
     }
 }
 

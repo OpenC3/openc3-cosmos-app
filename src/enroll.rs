@@ -177,6 +177,42 @@ pub fn forget_cached_ticket(root: &Path) {
     }
 }
 
+/// How the app is currently paired with a bridge (for the GUI's indicator).
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pairing {
+    /// Auto-enrolled over local Docker with the named bridge.
+    Auto(String),
+    /// Paired with the named bridge via a manual enrollment token.
+    Manual(String),
+    /// `OPENC3_BRIDGE_TICKET` overrides any saved pairing (can't be unpaired here).
+    Environment,
+}
+
+/// The pairing the next connection attempt will use, or `None` when unpaired.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn current_pairing(root: &Path) -> Option<Pairing> {
+    if std::env::var("OPENC3_BRIDGE_TICKET").is_ok_and(|t| !t.is_empty()) {
+        return Some(Pairing::Environment);
+    }
+    read_current(root).map(|c| if c.manual { Pairing::Manual(c.bridge) } else { Pairing::Auto(c.bridge) })
+}
+
+/// Forget the saved pairing (auto or manual). Unlike [`forget_cached_ticket`]
+/// this is a user request, so a manual token is dropped too. A co-located COSMOS
+/// will be auto-enrolled again on the next connection attempt; a remote one needs
+/// a new token from Admin → Bridges. A missing file is success.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn unpair(root: &Path) -> Result<()> {
+    match std::fs::remove_file(current_path(root)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("removing saved bridge pairing"),
+    }
+    crate::logging::info("bridge", "Unpaired from COSMOS bridge");
+    Ok(())
+}
+
 fn write_current(root: &Path, bridge: &str, ticket: &str, manual: bool) -> Result<()> {
     std::fs::create_dir_all(bridge_dir(root)).ok();
     let current = Current {
@@ -330,6 +366,19 @@ pub fn connect_bridge(ctx: &Context) -> Result<(String, BridgeClient), String> {
                         .map(|client| (fresh, client))
                         .map_err(connection_error);
                 }
+                if let TicketSource::CachedManual = resolved.source {
+                    // Can't be refreshed without user input: the hub was
+                    // recreated with a new identity (e.g. COSMOS data reset)
+                    // since this token was redeemed.
+                    crate::logging::warn(
+                        "bridge",
+                        &format!("manual bridge ticket has a stale peer certificate: {first_error:#}"),
+                    );
+                    return Err("the bridge's identity changed since this token was paired (was COSMOS \
+                         reset?) — Unpair, then pair with a new token from Admin → Bridges \
+                         (a local COSMOS re-pairs automatically)"
+                        .to_string());
+                }
             }
             Err(connection_error(first_error))
         }
@@ -368,7 +417,29 @@ fn connection_error(error: anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::peer_certificate_error;
+    use super::{current_pairing, peer_certificate_error, unpair, write_current, Pairing};
+
+    #[test]
+    fn unpair_forgets_manual_and_auto_pairings() {
+        if std::env::var("OPENC3_BRIDGE_TICKET").is_ok_and(|t| !t.is_empty()) {
+            return; // the env override masks the saved pairing
+        }
+        let root = std::env::temp_dir().join(format!("openc3-unpair-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(current_pairing(&root), None);
+
+        write_current(&root, "DEFAULT", "endpointabc", true).unwrap();
+        assert_eq!(current_pairing(&root), Some(Pairing::Manual("DEFAULT".into())));
+        unpair(&root).unwrap();
+        assert_eq!(current_pairing(&root), None);
+
+        write_current(&root, "OTHER", "endpointdef", false).unwrap();
+        assert_eq!(current_pairing(&root), Some(Pairing::Auto("OTHER".into())));
+        unpair(&root).unwrap();
+        assert_eq!(current_pairing(&root), None);
+        unpair(&root).unwrap(); // already unpaired is fine
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn recognizes_peer_certificate_errors() {

@@ -220,10 +220,14 @@ fn ensure_venv(python_dir: &Path, venv_dir: &Path, config: &MicroserviceConfig) 
     let devel_openc3 = openc3_devel_source();
     // The Python version and devel source are part of what's installed, so fold
     // them into the fingerprint: changing PYTHON_VERSION or toggling
-    // OPENC3_DEVEL (or changing its path) rebuilds the venv.
+    // OPENC3_DEVEL (or changing its path) rebuilds the venv. The editable
+    // install tracks the checkout's code but not its dependencies, so the
+    // checkout's pyproject.toml is hashed too: a dependency bump there (e.g. a
+    // new questdb minimum) rebuilds the venv instead of leaving stale packages.
     let mut fingerprint = format!("python:{PYTHON_VERSION}|{}", config.pip_fingerprint);
     if let Some(src) = &devel_openc3 {
-        fingerprint.push_str(&format!("|openc3-devel:{}", src.display()));
+        let deps = crate::hostfiles::pip_fingerprint(&[], std::slice::from_ref(src));
+        fingerprint.push_str(&format!("|openc3-devel:{}|{deps}", src.display()));
     }
     // Skip when the venv is present AND its installed inputs match the current
     // fingerprint. When they differ (e.g. a plugin upgrade changed requirements),
@@ -1022,7 +1026,7 @@ impl MicroserviceOperator {
             Err(reason) => {
                 let gave_up = self.enroll_attempts >= BRIDGE_MAX_ATTEMPTS;
                 self.unpaired_reason = Some(if gave_up {
-                    format!("auto-enroll failed after {BRIDGE_MAX_ATTEMPTS} tries — pair with a token ({reason})")
+                    format!("gave up after {BRIDGE_MAX_ATTEMPTS} tries — press Retry ({reason})")
                 } else {
                     reason
                 });
@@ -1240,8 +1244,8 @@ impl MicroserviceOperator {
     fn fetch(&mut self) -> ConfigMap {
         let Some(client) = &self.bridge_client else {
             let message = match &self.unpaired_reason {
-                Some(reason) => format!("Not paired with COSMOS: {reason}"),
-                None => "Not paired with COSMOS".to_string(),
+                Some(reason) => format!("Not connected to COSMOS: {reason}"),
+                None => "Not connected to COSMOS".to_string(),
             };
             self.publish_bridge_status(false, false, &message);
             return ConfigMap::new();

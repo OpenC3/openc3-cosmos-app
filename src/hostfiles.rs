@@ -150,7 +150,7 @@ fn is_relative_path(path: &str, nested: bool) -> bool {
 
 /// Fingerprint the venv-affecting inputs (requirements.txt + pyproject.toml
 /// contents), sorted, so a plugin upgrade that changes them updates the venv.
-fn pip_fingerprint(requirements: &[PathBuf], projects: &[PathBuf]) -> String {
+pub(crate) fn pip_fingerprint(requirements: &[PathBuf], projects: &[PathBuf]) -> String {
     let mut inputs: Vec<PathBuf> = requirements.to_vec();
     for project in projects {
         inputs.push(project.join("pyproject.toml"));
